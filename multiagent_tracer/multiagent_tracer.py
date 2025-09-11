@@ -2,7 +2,7 @@ import json
 import time
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from enum import Enum
 import networkx as nx
@@ -334,151 +334,105 @@ class MultiAgentTracer:
     def _build_aggregated_graph(
         self,
         include_types: Optional[Set[str]] = None,
-        hide_http_tools: bool = False,
+        hide_http_tools: bool = False,  # оставлено для совместимости; http/tool уже очищены в rebuild
         group_by: str = "agent_name",
     ) -> nx.DiGraph:
         """
-        Создает агрегированный граф, группируя узлы по имени агента или типу.
-        Считает веса ребер и агрегирует метрики (длительность, успехи).
-        Сохраняет связи между видимыми узлами, даже если промежуточные (например, HTTP-узлы) скрыты.
-        
-        Args:
-            include_types: Множество типов агентов для включения в граф (None = все типы из AgentType).
-            hide_http_tools: Если True, исключает HTTP-узлы (http_call::*, ::HTTP POST).
-            group_by: Группировка узлов: "agent_name" или "agent_type".
-        
-        Returns:
-            nx.DiGraph: Агрегированный направленный граф с узлами и ребрами.
+        Агрегация поверх очищенного invocations-графа.
+        group_by: "agent_name" (по каноническим именам) или "agent_type".
+        include_types: множество строковых типов, которые оставляем.
         """
-        include_types = include_types or set(AgentType.__members__.values())
+        G = self.call_graph
+        H = nx.DiGraph()
+        if G.number_of_nodes() == 0:
+            return H
 
-        def key_of(node_attrs: dict) -> Optional[str]:
-            name = str(node_attrs.get("agent_name", ""))
-            agent_type = str(node_attrs.get("agent_type", "custom"))
-            if hide_http_tools and (
-                name.startswith("http_call::") or name.endswith("::HTTP POST")
-            ):
-                return None
-            if agent_type not in include_types:
+        include_types = include_types or {t.value for t in AgentType}
+
+        def key_of(nd: dict) -> Optional[str]:
+            at = str(nd.get("agent_type", "custom"))
+            if at not in include_types:
                 return None
             if group_by == "agent_type":
-                return agent_type  # Группируем строго по типу
-            else:
-                # Для "agent_name" схлопываем суффиксы
-                return name.split("::")[0].split("/")[0]
+                return at
+            # имена уже канонизированы на этапе rebuild
+            return str(nd.get("agent_name", "unknown"))
 
-        H = nx.DiGraph()
-        node_aggr: Dict[str, Dict[str, Any]] = {}
-
-        # Собираем агрегаты по узлам
-        for node_id, attrs in self.call_graph.nodes(data=True):
-            key = key_of(attrs)
-            if not key:
+        # 1) агрегируем узлы
+        bag: Dict[str, Dict[str, Any]] = {}
+        for _, nd in G.nodes(data=True):
+            k = key_of(nd)
+            if not k:
                 continue
-            if key not in node_aggr:
-                node_aggr[key] = {
-                    "agent_name": key,  # Всегда обобщенное имя (тип или базовое имя)
-                    "agent_type": key if group_by == "agent_type" else attrs.get("agent_type", "custom"),
-                    "count": 0,
-                    "durations": [],
-                    "successes": [],
-                    "sub_names": set(),  # Новое: Список уникальных имен для дебаг
-                }
-            node_aggr[key]["count"] += 1
-            node_aggr[key]["sub_names"].add(attrs.get("agent_name", ""))
-            if "duration" in attrs and attrs["duration"] is not None:
-                node_aggr[key]["durations"].append(attrs["duration"])
-            if "success" in attrs:
-                node_aggr[key]["successes"].append(bool(attrs["success"]))
+            b = bag.setdefault(k, {
+                "agent_name": k if group_by == "agent_name" else nd.get("agent_name", k),
+                "agent_type": nd.get("agent_type", "custom") if group_by == "agent_type" else "custom",
+                "count": 0, "durations": [], "successes": []
+            })
+            b["count"] += 1
+            if nd.get("duration") is not None:
+                b["durations"].append(float(nd["duration"]))
+            if "success" in nd:
+                b["successes"].append(bool(nd["success"]))
 
-        # Добавляем узлы с метриками
-        for key, agg in node_aggr.items():
-            avg_duration = sum(agg["durations"]) / len(agg["durations"]) if agg["durations"] else None
-            success_rate = sum(agg["successes"]) / len(agg["successes"]) if agg["successes"] else None
+        for k, b in bag.items():
+            avg_dur = sum(b["durations"]) / len(b["durations"]) if b["durations"] else None
+            succ = sum(b["successes"]) / len(b["successes"]) if b["successes"] else None
             H.add_node(
-                key,
-                agent_name=agg["agent_name"],
-                agent_type=agg["agent_type"],
-                count=agg["count"],
-                duration=avg_duration,
-                success=success_rate if success_rate is not None else True,
-                sub_names=list(agg["sub_names"]),  # Для дебаг: какие имена схлопнуты
+                k,
+                agent_name=b["agent_name"],
+                agent_type=b["agent_type"] if group_by == "agent_type" else "custom",
+                count=b["count"],
+                duration=avg_dur,
+                success=True if succ is None else succ
             )
-            self.logger.debug(f"Aggregated node {key}: sub_names={agg['sub_names']}")
 
-        def find_visible_ancestor(node: str) -> Optional[str]:
-            """Находит ближайшего видимого предка с помощью BFS."""
-            from collections import deque
-            queue = deque([(node, 0)])  # (узел, расстояние)
-            visited = set()
-            min_distance = float('inf')
-            closest_ancestor = None
-
-            for ancestor in nx.ancestors(self.call_graph, node):
-                key = key_of(self.call_graph.nodes[ancestor])
-                if key and ancestor not in visited:
-                    # Вычисляем расстояние (глубину) от node до ancestor
-                    try:
-                        distance = nx.shortest_path_length(self.call_graph, ancestor, node)
-                        if distance < min_distance:
-                            min_distance = distance
-                            closest_ancestor = key
-                    except nx.NetworkXNoPath:
-                        continue
-                    visited.add(ancestor)
-            
-            if closest_ancestor:
-                self.logger.debug(f"Found closest ancestor for {node}: {closest_ancestor} (distance: {min_distance})")
-            return closest_ancestor
-
-        def find_visible_descendant(node: str) -> Optional[str]:
-            """Находит ближайшего видимого потомка с помощью BFS."""
-            from collections import deque
-            queue = deque([(node, 0)])  # (узел, расстояние)
-            visited = set()
-            min_distance = float('inf')
-            closest_descendant = None
-
-            for descendant in nx.descendants(self.call_graph, node):
-                key = key_of(self.call_graph.nodes[descendant])
-                if key and descendant not in visited:
-                    try:
-                        distance = nx.shortest_path_length(self.call_graph, node, descendant)
-                        if distance < min_distance:
-                            min_distance = distance
-                            closest_descendant = key
-                    except nx.NetworkXNoPath:
-                        continue
-                    visited.add(descendant)
-            
-            if closest_descendant:
-                self.logger.debug(f"Found closest descendant for {node}: {closest_descendant} (distance: {min_distance})")
-            return closest_descendant
-
-        # Агрегируем ребра
-        for u, v in self.call_graph.edges():
-            u_key = key_of(self.call_graph.nodes[u])
-            v_key = key_of(self.call_graph.nodes[v])
-            if u_key and v_key and u_key != v_key:
-                H.add_edge(u_key, v_key, weight=H.get_edge_data(u_key, v_key, {}).get("weight", 0) + 1)
-                self.logger.debug(f"Direct edge added: {u_key} -> {v_key}")
-            elif hide_http_tools:
-                u_visible = u_key if u_key else find_visible_ancestor(u)
-                v_visible = v_key if v_key else find_visible_descendant(v)
-                if u_visible and v_visible and u_visible != v_visible:
-                    H.add_edge(
-                        u_visible,
-                        v_visible,
-                        weight=H.get_edge_data(u_visible, v_visible, {}).get("weight", 0) + 1,
-                    )
-                    self.logger.debug(f"Edge through hidden node: {u_visible} -> {v_visible} (from {u} -> {v})")
-
-        if not H.nodes():
-            self.logger.warning("Aggregated graph is empty: no nodes included.")
-        elif not H.edges():
-            self.logger.warning("Aggregated graph has no edges: check hide_http_tools or include_types.")
+        # 2) агрегируем рёбра
+        for u, v in G.edges():
+            nu, nv = key_of(G.nodes[u]), key_of(G.nodes[v])
+            if nu and nv and nu != nv:
+                H.add_edge(nu, nv, weight=H.get_edge_data(nu, nv, {}).get("weight", 0) + 1)
 
         return H
+
+
+
+    def _canon_name(self, name: str) -> str:
+        """Единый канонический вид имени для всех представлений."""
+        if not name:
+            return "unknown"
+        # убираем http_call::*
+        if name.startswith("http_call::"):
+            name = name[len("http_call::"):]
+        # убираем суффиксы после :: (например ::HTTP POST)
+        name = name.split("::")[0]
+        # убираем /execute и прочие суффиксы после /
+        name = name.split("/")[0]
+        return name
+
+    def _is_http_wrapper_start(self, e: "TraceEvent") -> bool:
+        """HTTP-обёртка удаляется из invocations-графа (будем пересвязывать родителя с её детьми)."""
+        return (
+            e.event_type in (EventType.AGENT_START, EventType.TOOL_START)
+            and (
+                e.agent_name.startswith("http_call::")
+                or (e.event_type == EventType.TOOL_START and (e.data or {}).get("tool_name") == "HTTP POST")
+            )
+        )
+
+    def _is_ephemeral_step(self, start_ev: "TraceEvent", end_by_parent: dict) -> bool:
+        """
+        Мгновенные служебные шаги (например prepare_prompt с duration=0) выкидываем из графа.
+        """
+        if start_ev.event_type not in (EventType.AGENT_START, EventType.TOOL_START):
+            return False
+        nm = start_ev.agent_name
+        if self._canon_name(nm) in {"prepare_prompt"}:
+            end_ev = end_by_parent.get(start_ev.event_id)
+            # duration == 0 или end не найден — считаем шумом
+            return not end_ev or (end_ev.duration is not None and float(end_ev.duration) == 0.0)
+        return False
+
 
     def get_call_graph_viz(
         self,
@@ -558,6 +512,7 @@ class MultiAgentTracer:
             "custom": "circle",
         }
         arrow_annotations = []
+        approve_annotations = [] 
         # 1) линии рёбер + стрелочные аннотации поверх
         for u, v in graph.edges():
             x0, y0 = pos[u]
@@ -647,6 +602,19 @@ class MultiAgentTracer:
                     showlegend=False,
                 )
             )
+            if nd.get("approved"):
+                approve_annotations.append(dict(
+                    x=x, y=y + (node_size/80.0),
+                    xref="x", yref="y",
+                    text="approve ✅",
+                    showarrow=False,
+                    font=dict(size=max(10, label_font_size-1), color="#2c7"),
+                    align="center",
+                    bgcolor="rgba(255,255,255,0.75)",
+                    bordercolor="rgba(0,0,0,0.1)",
+                    borderwidth=1,
+                    opacity=0.95,
+                ))
 
         # 4) легенда
         for at, color in color_map.items():
@@ -660,7 +628,7 @@ class MultiAgentTracer:
                 )
             )
 
-        annotations = arrow_annotations + [
+        annotations = arrow_annotations + approve_annotations + [
             dict(
                 text="🟢 Зеленые стрелки = успешное выполнение | 🔴 Красные стрелки = ошибка",
                 showarrow=False, xref="paper", yref="paper",
@@ -698,152 +666,219 @@ class MultiAgentTracer:
             fig.write_html(output_file)
         return fig
 
-    # --------------------------
-    # Диаграммы/статистика
-    # --------------------------
-
+    # # --------------------------
+    # # Диаграммы/статистика
+    # # --------------------------
     def get_sequence_diagram(self, output_file: Optional[str] = None) -> go.Figure:
         if not self.events:
             return go.Figure()
 
-        sorted_events = sorted(self.events, key=lambda x: x.timestamp)
+        # индексы START/END
+        starts: Dict[str, TraceEvent] = {}
+        ends_by_parent: Dict[str, TraceEvent] = {}
+        for e in self.events:
+            if e.event_type in (EventType.AGENT_START, EventType.TOOL_START):
+                starts[e.event_id] = e
+            elif e.event_type in (EventType.AGENT_END, EventType.TOOL_END) and e.parent_event_id:
+                ends_by_parent[e.parent_event_id] = e
+
+        # видимые старты (те же правила, что в rebuild)
+        visible_start_ids: Set[str] = set()
+        for sid, s in starts.items():
+            if self._is_http_wrapper_start(s) or self._is_ephemeral_step(s, ends_by_parent):
+                continue
+            visible_start_ids.add(sid)
+
+        # сгруппируем по каноническим именам: учитываем ТОЛЬКО видимые START/END
+        evs_sorted = sorted(self.events, key=lambda x: x.timestamp)
+        agents: Dict[str, list] = {}
+        agent_y: Dict[str, int] = {}
+        y = 0
+
+        def canon(name: str) -> str:
+            return self._canon_name(name)
+
+        for e in evs_sorted:
+            if e.event_type in (EventType.AGENT_START, EventType.TOOL_START):
+                if e.event_id not in visible_start_ids:
+                    continue
+            elif e.event_type in (EventType.AGENT_END, EventType.TOOL_END):
+                if e.parent_event_id not in visible_start_ids:
+                    continue
+            else:
+                continue  # MESSAGE/ERROR/CUSTOM — обработаем позже в стрелках
+
+            nm = canon(e.agent_name)
+            if nm not in agents:
+                agents[nm] = []
+                agent_y[nm] = y
+                y += 1
+            agents[nm].append(e)
+
+        if not agents:
+            return go.Figure()
+
+        t0 = min(e.timestamp for e in evs_sorted)
+        t1 = max(e.timestamp for e in evs_sorted)
+
         fig = go.Figure()
 
-        agents = {}
-        agent_positions = {}
-        y_pos = 0
-        for e in sorted_events:
-            if e.agent_name not in agents:
-                agents[e.agent_name] = []
-                agent_positions[e.agent_name] = y_pos
-                y_pos += 1
-            agents[e.agent_name].append(e)
-
-        event_colors = {
-            "AGENT_START": "#2ECC71",
-            "AGENT_END": "#3498DB",
-            "TOOL_START": "#F39C12",
-            "TOOL_END": "#E67E22",
-            "MESSAGE_SENT": "#9B59B6",
-            "ERROR": "#E74C3C",
-            "CUSTOM": "#95A5A6",
-        }
-
-        for agent_name, y_position in agent_positions.items():
-            fig.add_trace(
-                go.Scatter(
-                    x=[sorted_events[0].timestamp, sorted_events[-1].timestamp],
-                    y=[y_position, y_position],
-                    mode="lines",
-                    line=dict(color="lightgray", width=1, dash="dash"),
-                    showlegend=False,
-                    hoverinfo="skip",
-                )
-            )
-            for e in agents[agent_name]:
-                color = event_colors.get(e.event_type.value, "#95A5A6")
-                marker_size = 15 if e.event_type.value in ["AGENT_START", "AGENT_END"] else 9
-                if e.event_type.value == "ERROR":
-                    symbol = "x"
-                elif e.event_type.value in ["AGENT_START", "TOOL_START"]:
-                    symbol = "circle"
-                elif e.event_type.value in ["AGENT_END", "TOOL_END"]:
-                    symbol = "square"
-                else:
-                    symbol = "diamond"
-
-                hover_text = (
-                    f"<b>{e.agent_name}</b><br>"
-                    f"Событие: {e.event_type.value}<br>"
-                    f"Время: {datetime.fromtimestamp(e.timestamp).strftime('%H:%M:%S.%f')[:-3]}<br>"
-                    f"Данные: {str(e.data)[:100]}{'...' if len(str(e.data)) > 100 else ''}"
-                )
-                fig.add_trace(
-                    go.Scatter(
-                        x=[e.timestamp],
-                        y=[y_position],
+        # lifelines + activation boxes + точки START/END
+        for nm, yy in agent_y.items():
+            fig.add_trace(go.Scatter(
+                x=[datetime.fromtimestamp(t0), datetime.fromtimestamp(t1)],
+                y=[yy, yy], mode="lines",
+                line=dict(color="lightgray", width=1, dash="dash"),
+                showlegend=False, hoverinfo="skip"
+            ))
+            for e in agents[nm]:
+                if e.event_type in (EventType.AGENT_START, EventType.TOOL_START):
+                    end = ends_by_parent.get(e.event_id)
+                    if end:
+                        fig.add_shape(
+                            type="rect",
+                            x0=datetime.fromtimestamp(e.timestamp),
+                            y0=yy - 0.12,
+                            x1=datetime.fromtimestamp(end.timestamp),
+                            y1=yy + 0.12,
+                            fillcolor="lightblue",
+                            opacity=0.3, layer="below", line_width=0
+                        )
+                    fig.add_trace(go.Scatter(
+                        x=[datetime.fromtimestamp(e.timestamp)], y=[yy],
                         mode="markers",
-                        marker=dict(size=marker_size, color=color, symbol=symbol, line=dict(width=2, color="white")),
-                        name=e.event_type.value,
-                        hovertext=hover_text,
-                        hoverinfo="text",
-                        showlegend=False,
-                    )
+                        marker=dict(size=12, color="#2ECC71", symbol="circle", line=dict(width=2, color="white")),
+                        hovertext=f"<b>{nm}</b><br>START<br>{datetime.fromtimestamp(e.timestamp).strftime('%H:%M:%S.%f')[:-3]}",
+                        hoverinfo="text", showlegend=False
+                    ))
+                elif e.event_type in (EventType.AGENT_END, EventType.TOOL_END):
+                    fig.add_trace(go.Scatter(
+                        x=[datetime.fromtimestamp(e.timestamp)], y=[yy],
+                        mode="markers",
+                        marker=dict(size=12, color="#3498DB", symbol="square", line=dict(width=2, color="white")),
+                        hovertext=f"<b>{nm}</b><br>END<br>{datetime.fromtimestamp(e.timestamp).strftime('%H:%M:%S.%f')[:-3]}",
+                        hoverinfo="text", showlegend=False
+                    ))
+
+        # стрелки: сначала структурные (parent START -> child START), потом message_sent
+        # -- поднимаем родителя к видимому предку
+        def lift_to_visible(start_id: Optional[str]) -> Optional[str]:
+            cur = start_id
+            visited = set()
+            while cur and cur not in visible_start_ids and cur not in visited:
+                visited.add(cur)
+                if cur not in starts:
+                    return None
+                cur = starts[cur].parent_event_id
+            return cur if cur in visible_start_ids else None
+
+        idx = {e.event_id: e for e in evs_sorted}
+        added_event_pairs = set()     # (parent_start_id, child_start_id)
+        struct_name_pairs = set()     # (from_name, to_name) — для блокировки дубля message_sent
+
+        for sid in visible_start_ids:
+            s = starts[sid]
+            raw_parent = s.parent_event_id
+            if not raw_parent or raw_parent not in idx:
+                continue
+            vis_parent = lift_to_visible(raw_parent)
+            if not vis_parent:
+                continue
+            p = starts[vis_parent]
+            frm, to = canon(p.agent_name), canon(s.agent_name)
+            if frm in agent_y and to in agent_y and (vis_parent, sid) not in added_event_pairs and frm != to:
+                added_event_pairs.add((vis_parent, sid))
+                struct_name_pairs.add((frm, to))
+                fig.add_annotation(
+                    x=datetime.fromtimestamp(s.timestamp), y=agent_y[to],
+                    ax=datetime.fromtimestamp(p.timestamp), ay=agent_y[frm],
+                    xref="x", yref="y", axref="x", ayref="y",
+                    arrowhead=3, arrowsize=1.0, arrowwidth=1.4, arrowcolor="#3498DB", opacity=0.85
                 )
 
-        # Стрелки между агентами (по parent_event_id)
-        idx_by_id = {e.event_id: e for e in sorted_events}
-        for e in sorted_events:
-            if e.parent_event_id and e.parent_event_id in idx_by_id:
-                p = idx_by_id[e.parent_event_id]
-                if p.agent_name != e.agent_name:
-                    fig.add_annotation(
-                        x=e.timestamp,
-                        y=agent_positions[e.agent_name],
-                        ax=p.timestamp,
-                        ay=agent_positions[p.agent_name],
-                        xref="x",
-                        yref="y",
-                        axref="x",
-                        ayref="y",
-                        arrowhead=2,
-                        arrowsize=1,
-                        arrowwidth=1.5,
-                        arrowcolor="#3498DB",
-                        opacity=0.7,
-                    )
+        # message_sent — рисуем только если НЕТ структурной связи между этими именами
+        for e in evs_sorted:
+            if e.event_type != EventType.MESSAGE_SENT:
+                continue
+            frm = canon((e.data or {}).get("from_agent", ""))
+            to  = canon((e.data or {}).get("to_agent", ""))
+            if not frm or not to or frm == to:
+                continue
+            if frm in agent_y and to in agent_y and (frm, to) not in struct_name_pairs:
+                t = datetime.fromtimestamp(e.timestamp)
+                fig.add_annotation(
+                    x=t, y=agent_y[to], ax=t, ay=agent_y[frm],
+                    xref="x", yref="y", axref="x", ayref="y",
+                    arrowhead=3, arrowsize=1.0, arrowwidth=1.2, arrowcolor="#9B59B6", opacity=0.85, standoff=4
+                )
 
         fig.update_layout(
             title=dict(text="📊 Agent Execution Sequence Diagram", x=0.5, xanchor="center", font=dict(size=18)),
-            xaxis=dict(title="Время выполнения", tickformat="%H:%M:%S", showgrid=True, gridcolor="lightgray"),
+            xaxis=dict(title="Время", tickformat="%H:%M:%S", showgrid=True, gridcolor="lightgray"),
             yaxis=dict(
                 title="Агенты",
                 tickmode="array",
-                tickvals=list(agent_positions.values()),
-                ticktext=list(agent_positions.keys()),
-                showgrid=False,
+                tickvals=list(agent_y.values()),
+                ticktext=list(agent_y.keys()),
+                showgrid=False
             ),
             hovermode="closest",
-            height=max(400, len(agents) * 80),
-            showlegend=True,
-            legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99),
+            height=max(400, len(agent_y) * 80),
+            showlegend=False
         )
 
         if output_file:
             fig.write_html(output_file)
         return fig
 
+
+
     def get_timeline_viz(self, output_file: Optional[str] = None) -> go.Figure:
         if not self.events:
             return go.Figure()
 
-        agents = list(set(e.agent_name for e in self.events))
-        agent_colors = px.colors.qualitative.Set3[: len(agents)]
-        fig = go.Figure()
-
-        # Соберём start/end по parent_event_id
-        ev_by_agent: Dict[str, List[TraceEvent]] = {}
+        # те же правила видимости, что и в rebuild/sequence
+        starts: Dict[str, TraceEvent] = {}
+        ends: Dict[str, TraceEvent] = {}
         for e in self.events:
-            ev_by_agent.setdefault(e.agent_name, []).append(e)
+            if e.event_type in (EventType.AGENT_START, EventType.TOOL_START):
+                starts[e.event_id] = e
+            elif e.event_type in (EventType.AGENT_END, EventType.TOOL_END) and e.parent_event_id:
+                ends[e.parent_event_id] = e
 
-        for i, (agent, evs) in enumerate(ev_by_agent.items()):
-            starts = [e for e in evs if e.event_type == EventType.AGENT_START]
-            ends = [e for e in evs if e.event_type == EventType.AGENT_END]
-            for s in starts:
-                end = next((ee for ee in ends if ee.parent_event_id == s.event_id), None)
-                if not end:
-                    continue
-                fig.add_trace(
-                    go.Scatter(
-                        x=[datetime.fromtimestamp(s.timestamp), datetime.fromtimestamp(end.timestamp)],
-                        y=[i, i],
-                        mode="lines+markers",
-                        name=agent,
-                        line=dict(width=8, color=agent_colors[i % len(agent_colors)]),
-                        hovertemplate=f"Agent: {agent}<br>Duration: {(end.duration or 0):.2f}s<br>Success: {bool(end.success)}<extra></extra>",
-                        showlegend=False,
-                    )
-                )
+        visible: Dict[str, TraceEvent] = {}
+        for sid, s in starts.items():
+            if self._is_http_wrapper_start(s) or self._is_ephemeral_step(s, ends):
+                continue
+            visible[sid] = s
+
+        groups: Dict[str, list] = {}
+        for sid, s in visible.items():
+            end = ends.get(sid)
+            if not end:
+                continue
+            nm = self._canon_name(s.agent_name)
+            groups.setdefault(nm, []).append((s, end))
+
+        if not groups:
+            return go.Figure()
+
+        agents = list(groups.keys())
+        fig = go.Figure()
+        palette = px.colors.qualitative.Set3
+
+        for i, name in enumerate(agents):
+            for s, e in sorted(groups[name], key=lambda t: t[0].timestamp):
+                fig.add_trace(go.Scatter(
+                    x=[datetime.fromtimestamp(s.timestamp), datetime.fromtimestamp(e.timestamp)],
+                    y=[i, i],
+                    mode="lines+markers",
+                    line=dict(width=8, color=palette[i % len(palette)]),
+                    marker=dict(size=6),
+                    name=name,
+                    hovertemplate=f"{name}<br>Duration: {(e.duration or 0):.2f}s<br>Success: {bool(e.success)}<extra></extra>",
+                    showlegend=False
+                ))
 
         fig.update_layout(
             title="Multi-Agent System Timeline",
@@ -856,6 +891,7 @@ class MultiAgentTracer:
         if output_file:
             fig.write_html(output_file)
         return fig
+
 
     # --------------------------
     # Статистика
@@ -991,33 +1027,89 @@ class MultiAgentTracer:
         self._rebuild_call_graph()
 
     def _rebuild_call_graph(self):
-        """Полная реконструкция invocations-графа из списка событий"""
+        """
+        Полная реконструкция invocations-графа из self.events с чисткой:
+        - убираем http-обёртки (http_call::*, ::HTTP POST), пересвязываем родителя с детьми;
+        - убираем мгновенные служебные шаги (например prepare_prompt с duration=0);
+        - у всех узлов используем канонические имена (без http_call:: и /execute).
+        """
         self.call_graph.clear()
+        if not self.events:
+            return
 
-        start_kinds = {EventType.AGENT_START, EventType.TOOL_START}
+        # 1) индексы
+        starts: Dict[str, TraceEvent] = {}
+        end_by_parent: Dict[str, TraceEvent] = {}
+        children: Dict[str, list] = {}
 
-        # Ноды для стартов
         for e in self.events:
-            if e.event_type in start_kinds:
-                self.call_graph.add_node(
-                    e.event_id,
-                    agent_name=e.agent_name,
-                    agent_type=(e.agent_type.value if isinstance(e.agent_type, AgentType) else str(e.agent_type)),
-                    start_time=e.timestamp,
-                )
+            if e.event_type in (EventType.AGENT_START, EventType.TOOL_START):
+                starts[e.event_id] = e
+            elif e.event_type in (EventType.AGENT_END, EventType.TOOL_END) and e.parent_event_id:
+                end_by_parent[e.parent_event_id] = e
 
-        # Рёбра parent -> child (по стартовым)
-        for e in self.events:
-            if e.event_type in start_kinds and e.parent_event_id and e.parent_event_id in self.call_graph:
-                self.call_graph.add_edge(e.parent_event_id, e.event_id)
+        for s in starts.values():
+            if s.parent_event_id:
+                children.setdefault(s.parent_event_id, []).append(s.event_id)
 
-        # Длительности/успехи с END-событий
-        for e in self.events:
-            if e.event_type in (EventType.AGENT_END, EventType.TOOL_END) and e.parent_event_id in self.call_graph:
-                node = self.call_graph.nodes[e.parent_event_id]
-                node["duration"] = e.duration
-                node["success"] = e.success
-                node["end_time"] = e.timestamp
+        # 2) решаем, какие стартовые узлы оставлять
+        keep: Set[str] = set()
+        drop: Set[str] = set()
+        for sid, s in starts.items():
+            if self._is_http_wrapper_start(s) or self._is_ephemeral_step(s, end_by_parent):
+                drop.add(sid)
+            else:
+                keep.add(sid)
+
+        # 3) создаём узлы для keep с каноническими именами
+        for sid in keep:
+            s = starts[sid]
+            self.call_graph.add_node(
+                sid,
+                agent_name=self._canon_name(s.agent_name),
+                agent_type=(s.agent_type.value if isinstance(s.agent_type, AgentType) else str(s.agent_type)),
+                start_time=s.timestamp,
+            )
+
+        # 4) вспомогательный «подъём» к ближ. видимому предку
+        def lift_to_visible(start_id: Optional[str]) -> Optional[str]:
+            cur = start_id
+            visited = set()
+            while cur and cur not in keep and cur not in visited:
+                visited.add(cur)
+                if cur not in starts:
+                    return None
+                cur = starts[cur].parent_event_id
+            return cur if cur in keep else None
+
+        # 5) рёбра parent -> child (для видимых)
+        for sid, s in starts.items():
+            if sid in drop:
+                continue
+            parent_vis = lift_to_visible(s.parent_event_id)
+            if parent_vis and parent_vis in self.call_graph and sid in self.call_graph and parent_vis != sid:
+                self.call_graph.add_edge(parent_vis, sid)
+
+        # 6) рёбра через скрытые узлы: предок(hid) -> внук(child)
+        for hid in drop:
+            # ближайший видимый предок скрытого узла
+            pv = lift_to_visible(starts[hid].parent_event_id if hid in starts else None)
+            if not pv:
+                continue
+            for ch in children.get(hid, []):
+                if ch in keep and pv in self.call_graph and ch in self.call_graph and pv != ch:
+                    self.call_graph.add_edge(pv, ch)
+
+        # 7) duration/success/end_time из *_END
+        for sid in keep:
+            end = end_by_parent.get(sid)
+            if end and sid in self.call_graph:
+                nd = self.call_graph.nodes[sid]
+                nd["duration"] = end.duration
+                nd["success"] = bool(end.success)
+                nd["end_time"] = end.timestamp
+
+
 
 
 # ============================================================
@@ -1144,7 +1236,8 @@ class LangGraphTracer:
             
             # Линия жизни агента
             fig.add_trace(go.Scatter(
-                x=[sorted_events[0].timestamp, sorted_events[-1].timestamp],
+                x=[datetime.fromtimestamp(sorted_events[0].timestamp),
+                    datetime.fromtimestamp(sorted_events[-1].timestamp)],
                 y=[y_position, y_position],
                 mode='lines',
                 line=dict(color='lightgray', width=1, dash='dash'),
@@ -1154,10 +1247,10 @@ class LangGraphTracer:
             
             # События агента
             for event in agent_events:
-                color = event_colors.get(event.event_type.value, '#95A5A6')
+                color = event_colors.get(event.event_type.name, '#95A5A6')
                 
                 # Размер маркера зависит от типа события
-                marker_size = 15 if event.event_type.value in ['AGENT_START', 'AGENT_END'] else 8
+                marker_size = 15 if event.event_type.name in ['AGENT_START', 'AGENT_END'] else 8
                 
                 # Символ маркера
                 if event.event_type.value == 'ERROR':
@@ -1178,7 +1271,7 @@ class LangGraphTracer:
                 """
                 
                 fig.add_trace(go.Scatter(
-                    x=[event.timestamp],
+                    x=[datetime.fromtimestamp(event.timestamp)],
                     y=[y_position],
                     mode='markers',
                     marker=dict(
@@ -1202,9 +1295,9 @@ class LangGraphTracer:
                     # Добавляем стрелку между агентами
                 
                     fig.add_annotation(
-                        x=event.timestamp,
+                        x=datetime.fromtimestamp(event.timestamp),
                         y=agent_positions[event.agent_name],
-                        ax=parent_event.timestamp,
+                        ax=datetime.fromtimestamp(parent_event.timestamp),
                         ay=agent_positions[parent_event.agent_name],
                         xref='x', yref='y',
                         axref='x', ayref='y',
@@ -1214,7 +1307,20 @@ class LangGraphTracer:
                         arrowcolor='#3498DB',
                         opacity=0.7
                     )
-        
+        for e in sorted_events:
+            if e.event_type == EventType.MESSAGE_SENT:
+                frm = (e.data or {}).get("from_agent")
+                to  = (e.data or {}).get("to_agent")
+                if frm in agent_positions and to in agent_positions:
+                    t = datetime.fromtimestamp(e.timestamp)
+                    fig.add_annotation(
+                        x=t, y=agent_positions[to],
+                        ax=t, ay=agent_positions[frm],
+                        xref="x", yref="y", axref="x", ayref="y",
+                        arrowhead=3, arrowsize=1.0, arrowwidth=1.2,
+                        arrowcolor="#9B59B6",  # тот же цвет, что и в legend для MESSAGE_SENT
+                        opacity=0.85, standoff=4
+                    )
         # Создаем легенду для типов событий
         for event_type, color in event_colors.items():
             fig.add_trace(go.Scatter(
