@@ -41,7 +41,6 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
         trace_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
         start_ts = time.time()
 
-        # --- Request logging
         raw_req = await request.body()
         self.log_fn(
             service=self.service_name,
@@ -52,31 +51,25 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
             body=_truncate(_safe_text(raw_req)),
         )
 
-        # --- Call downstream
         resp = await call_next(request)
 
-        # Drain body_iterator to log response body
         body = b""
         async for chunk in resp.body_iterator:
             body += chunk
 
-        # Preserve headers & content type
         headers = dict(resp.headers)
         if "content-type" not in {k.lower(): v for k, v in headers.items()}:
-            # Умная догадка: если это JSON-подобно — ставим JSON
             if body[:1] in (b"{", b"["):
                 headers["content-type"] = "application/json; charset=utf-8"
             else:
                 headers["content-type"] = "text/plain; charset=utf-8"
 
-        # Rebuild response WITHOUT media_type arg, чтобы не перезаписать content-type
         new_resp = Response(
             content=body,
             status_code=resp.status_code,
             headers=headers,
         )
 
-        # --- Response logging
         self.log_fn(
             service=self.service_name,
             event="response_out",
@@ -112,19 +105,16 @@ class LoggingCallback(BaseCallbackHandler):
         self.log_file = log_file
 
     def _emit(self, **fields):
-        # в файл (чтобы всегда что-то писалось)
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] " + " ".join(f"{k}={repr(v)[:500]}" for k, v in fields.items())
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-        # в внешний логгер, если передан
         if self.log_fn:
             try:
-                self.log_fn(**fields)  # ИМЕНОВАННЫЕ аргументы!
+                self.log_fn(**fields) 
             except Exception as e:
                 logging.warning(f"LoggingCallback log_fn failed: {e}")
 
-    # LLM события
     def on_llm_start(self, serialized, prompts, **kwargs):
         self._emit(event="llm_start", prompts=prompts)
 
@@ -135,14 +125,12 @@ class LoggingCallback(BaseCallbackHandler):
             text = str(response)
         self._emit(event="llm_end", text=text[:2000])
 
-    # Цепочки
     def on_chain_start(self, serialized, inputs, **kwargs):
         self._emit(event="chain_start", inputs=inputs)
 
     def on_chain_end(self, outputs, **kwargs):
         self._emit(event="chain_end", outputs=str(outputs)[:2000])
 
-    # Инструменты
     def on_tool_start(self, serialized, input_str, **kwargs):
         self._emit(event="tool_start", tool=serialized.get("name"), input=str(input_str)[:500])
 

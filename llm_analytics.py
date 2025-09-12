@@ -12,17 +12,10 @@ except Exception as e:
     print(f"Import error: {e}")
     ChatOpenAI = None
 
-    
-# llm_analytics.py
-# Агент-аналитик: принимает JSON трассы MultiAgentTracer, вызывает LLM по чанкам,
-# складывает оценки в поле "assessments" и возвращает новый JSON.
-# Также умеет работать в офлайн-фолбэке (без API-ключа) — проставляет approve=успех.
-
 
 MODEL_NAME_DEFAULT = os.getenv("LLM_MODEL", "gpt-4o-mini")
-MAX_EVENTS_PER_CHUNK = 12  # оптимальный размер чанка
+MAX_EVENTS_PER_CHUNK = 12  
 
-# JSON Schema для валидации ответов LLM
 OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -60,11 +53,10 @@ OUTPUT_SCHEMA = {
 def run_prechecks(session: Dict[str, Any]) -> Dict[str, Any]:
     """Выполняет предварительные проверки на корректность событий."""
     events = session.get("events", [])
-    # map event_id -> event
+
     id_map = {e["event_id"]: e for e in events}
     pre_tags = {}
     
-    # Проверяем корректность цепочек вызовов tool
     for e in events:
         if e.get("event_type") == "message_sent":
             msg = str(e.get("data",{}).get("message",""))
@@ -77,7 +69,6 @@ def run_prechecks(session: Dict[str, Any]) -> Dict[str, Any]:
                 if not found:
                     pre_tags[e["event_id"]] = pre_tags.get(e["event_id"], []) + ["missing_tool_result"]
 
-    # Проверяем наличие output в tool_end событиях
     for e in events:
         if e.get("event_type","").endswith("_end") and e.get("agent_type") == "tool":
             if e.get("data",{}).get("output") is None:
@@ -134,7 +125,7 @@ def _extract_approved_ids(assessed_events: List[Dict[str, Any]]) -> Set[str]:
 
 
 MODEL_NAME_DEFAULT = "gpt-4o-mini"
-MAX_EVENTS_PER_CHUNK = 30  # оставьте ваше значение
+MAX_EVENTS_PER_CHUNK = 30 
 
 def classify_session_with_llm(
     session_json: Dict[str, Any],
@@ -152,7 +143,7 @@ def classify_session_with_llm(
         """Пробует вытащить JSON из ответа модели (в т.ч. из кодовых блоков)."""
         if not text:
             return None
-        # вырежем самый большой JSON-блок
+
         m = re.search(r"\{[\s\S]*\}", text)
         if not m:
             return None
@@ -191,11 +182,9 @@ def classify_session_with_llm(
         }
         return assessed, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-    # Если модели нет — сразу фолбэк
     if model is None:
         return _offline_result()
 
-    # helpers
     def _invoke_with_backoff(_model, _messages, max_retries: int = 4):
         last = None
         for attempt in range(max_retries + 1):
@@ -203,14 +192,13 @@ def classify_session_with_llm(
                 return _model.invoke(_messages)
             except Exception as e:
                 txt = str(e).lower()
-                # только 429/5xx пытаемся ретраить; всё остальное — отдаём на верхний try/except
+
                 is_429 = ("rate limit" in txt) or ("429" in txt)
                 is_5xx = any(s in txt for s in ["502", "503", "504"])
                 if not (is_429 or is_5xx):
                     raise
                 last = e
                 wait = (2 ** attempt) + random.random() * 0.5
-                # уважаем X-RateLimit-Reset если он есть
                 try:
                     reset_ms = None
                     if hasattr(e, "response") and getattr(e, "response", None):
@@ -235,11 +223,10 @@ def classify_session_with_llm(
         """
         if not isinstance(text, str) or not text.strip():
             return None
-        # Срежем код-блоки
+
         fenced = re.search(r"```(?:json)?\s*({.*?})\s*```", text, flags=re.S|re.I)
         candidate = fenced.group(1) if fenced else None
         if not candidate:
-            # fallback: первый { ... } блок
             brace = re.search(r"(\{.*\})", text, flags=re.S)
             candidate = brace.group(1) if brace else None
         if not candidate:
@@ -255,11 +242,9 @@ def classify_session_with_llm(
         Принмает либо dict, либо строку.
         """
         if isinstance(final_text, dict):
-            # Уже объект — просто нормализуем ключи, если названы иначе
             summary = final_text.get("summary") or final_text.get("overview") or final_text.get("text") or ""
             sugg = final_text.get("improvement_suggestions") or final_text.get("recommendations") or []
             review = final_text.get("expert_review") or final_text.get("analysis") or summary
-            # гарантируем типы
             if isinstance(sugg, str):
                 sugg = [s.strip("-• ").strip() for s in sugg.splitlines() if s.strip()]
             return {
@@ -268,12 +253,10 @@ def classify_session_with_llm(
                 "expert_review": str(review or summary or "")
             }
 
-        # Иначе это строка: попробуем вытащить JSON из текста
         parsed = _extract_json_block(str(final_text))
         if isinstance(parsed, dict):
             return _coerce_session_assessment(parsed)
 
-        # Последний вариант: разберём буллеты из текста как рекомендации
         lines = [ln.strip() for ln in str(final_text).splitlines()]
         bullets = [ln for ln in lines if re.match(r"^(\-|\*|\d+[\.\)])\s+", ln)]
         cleaned = [re.sub(r"^(\-|\*|\d+[\.\)])\s+", "", b).strip() for b in bullets]
@@ -293,7 +276,6 @@ def classify_session_with_llm(
         completion = 0
         reasoning = 0
 
-        # 1) Стандартные поля LangChain/OpenAI
         meta = getattr(resp, "response_metadata", {}) or {}
         usage = (
             meta.get("token_usage")
@@ -308,7 +290,6 @@ def classify_session_with_llm(
         prompt = _to_int(usage.get("prompt_tokens") or usage.get("input_tokens") or prompt)
         completion = _to_int(usage.get("completion_tokens") or usage.get("output_tokens") or completion)
 
-        # 2) Заголовки (OpenRouter часто кладёт их туда)
         headers = meta.get("headers") or {}
         headers_l = {str(k).lower(): v for k, v in headers.items()} if isinstance(headers, dict) else {}
 
@@ -324,10 +305,6 @@ def classify_session_with_llm(
             headers_l.get("x-openrouter-reasoning-tokens") or
             headers_l.get("x-openrouter-tokens-reasoning")
         )
-
-        # 3) «Нативные» поля провайдера (как в вашей метадате Venice)
-        #   иногда провайдерские метаданные попадают в response_metadata под разными ключами;
-        #   обойдём несколько распространённых вариантов.
         provider_meta = (
             meta.get("provider_meta") or
             meta.get("openrouter", {}).get("meta") or
@@ -347,7 +324,6 @@ def classify_session_with_llm(
             "total_tokens": prompt + completion + reasoning,
         }
 
-    # prechecks (не критично)
     try:
         pre_tags = run_prechecks(session_json)
     except Exception:
@@ -371,7 +347,6 @@ def classify_session_with_llm(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    # Основной цикл по чанкам — защищаем каждый вызов
     for chunk in event_chunks:
         try:
             chunk_json = json.dumps(chunk, ensure_ascii=False, indent=2)
@@ -388,7 +363,7 @@ def classify_session_with_llm(
             total_completion_tokens += usage["completion_tokens"]
             reasoning_here = usage.get("reasoning_tokens", 0)
         except Exception as e:
-            # Любая ошибка (включая JSONDecodeError внутри SDK) — полный офлайн-фолбэк
+
             print(f"[LLM chunk error] {e}. Falling back to offline.")
             return _offline_result()
 
@@ -405,7 +380,6 @@ def classify_session_with_llm(
             })
         chunk_assessments.append(text)
 
-    # Финальный сводный запрос — тоже под защитой
     try:
         final_prompt = (
             "Given the analyses above, provide a concise overall session assessment and 3 improvement suggestions."
@@ -436,7 +410,6 @@ def classify_session_with_llm(
     token_stats = {
         "prompt_tokens": total_prompt_tokens,
         "completion_tokens": total_completion_tokens,
-        # reasoning копим по месту, если провайдер его отдаёт (см. _extract_usage)
         "reasoning_tokens": 0,
         "total_tokens": total_prompt_tokens + total_completion_tokens,
     }
@@ -465,12 +438,10 @@ def analyze_trace_bytes(
     session_view = _session_view_from_trace(trace)
     session_view["_success_map"] = _build_success_map(trace)
 
-    # --- подготовка LLM ---
     def _normalize_base_url(url: Optional[str]) -> Optional[str]:
         if not url:
             return None
         u = url.rstrip("/")
-        # для OpenRouter гарантируем /api/v1
         if "openrouter.ai" in u and not u.endswith("/api/v1") and not u.endswith("/v1"):
             return u + "/api/v1"
         return u
@@ -479,7 +450,6 @@ def analyze_trace_bytes(
         if not mname:
             return MODEL_NAME_DEFAULT
         if burl and "openrouter.ai" in burl and "/" not in mname:
-            # OpenRouter требует провайдер/модель, например: openai/gpt-4o-mini
             return f"openai/{mname}"
         return mname
 
@@ -487,9 +457,7 @@ def analyze_trace_bytes(
     token_stats = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     if use_llm and ("ChatOpenAI" in globals()) and (ChatOpenAI is not None):
-        # не затираем вручную: используем переданное или окружение
         base_url = _normalize_base_url(base_url or os.getenv("LLM_BASE_URL"))
-        # если явно на OpenRouter — возьмём OPENROUTER_API_KEY приоритетно
         api_key = (
             api_key
             or (os.getenv("OPENROUTER_API_KEY") if (base_url and "openrouter.ai" in base_url) else None)
@@ -515,13 +483,11 @@ def analyze_trace_bytes(
             try:
                 model = ChatOpenAI(**kwargs)
             except Exception as e:
-                # не даём упасть — уйдём в офлайн
                 print(f"[LLM init error] {e}. Using offline fallback.")
                 model = None
         else:
             print("API key not provided. Using offline fallback.")
 
-    # --- анализ ---
     assessed, _token_stats = classify_session_with_llm(
         session_view,
         model_name=model_name,
