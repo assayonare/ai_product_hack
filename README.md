@@ -13,6 +13,8 @@
 ├─ app.py                       # Утилита запуска Streamlit на фиксированном порту
 └─ multiagent_tracer/
    └─ multiagent_tracer.py      # Класс MultiAgentTracer: сбор событий, rebuild графа, граф/sequence/timeline
+└─ notebooks/
+   └─ ai_product_agent.py       # Ноутбук для тестирования и отладки
 ```
 
 *Streamlit-приложение поднимает сам оркестратор и агентов в фоновом режиме через `uvicorn`.*
