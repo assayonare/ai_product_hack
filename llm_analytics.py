@@ -1,25 +1,89 @@
+from __future__ import annotations
+
+import random, time as _time
+import os, json, uuid
+from typing import Dict, Any, List, Tuple, Set, Optional
+import re
+try:
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import SystemMessage, HumanMessage
+    from jsonschema import validate, ValidationError
+except Exception as e:
+    print(f"Import error: {e}")
+    ChatOpenAI = None
+
+    
 # llm_analytics.py
 # Агент-аналитик: принимает JSON трассы MultiAgentTracer, вызывает LLM по чанкам,
 # складывает оценки в поле "assessments" и возвращает новый JSON.
 # Также умеет работать в офлайн-фолбэке (без API-ключа) — проставляет approve=успех.
 
-from __future__ import annotations
-import os, json, uuid
-from typing import Dict, Any, List, Tuple, Set, Optional
-
-# Опциональная зависимость: LangChain ChatOpenAI
-try:
-    from langchain_openai import ChatOpenAI
-    from langchain_core.messages import SystemMessage, HumanMessage
-except Exception:
-    ChatOpenAI = None
 
 MODEL_NAME_DEFAULT = os.getenv("LLM_MODEL", "gpt-4o-mini")
-MAX_EVENTS_PER_CHUNK = 14  # чуть больше, чем было
+MAX_EVENTS_PER_CHUNK = 12  # оптимальный размер чанка
+
+# JSON Schema для валидации ответов LLM
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "events": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string"},
+                    "assessment": {
+                        "type": "object",
+                        "properties": {
+                            "verdict": {"type": "string"},
+                            "categories": {"type": "array"},
+                            "severity": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "explanation": {"type": "string"},
+                            "suggested_fix": {"type": "string"}
+                        },
+                        "required": ["verdict", "categories", "confidence"]
+                    }
+                },
+                "required": ["event_id", "assessment"]
+            }
+        },
+        "session_assessment": {"type": "object"}
+    },
+    "required": ["events", "session_assessment"]
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Помощники
 # ──────────────────────────────────────────────────────────────────────────────
+
+def run_prechecks(session: Dict[str, Any]) -> Dict[str, Any]:
+    """Выполняет предварительные проверки на корректность событий."""
+    events = session.get("events", [])
+    # map event_id -> event
+    id_map = {e["event_id"]: e for e in events}
+    pre_tags = {}
+    
+    # Проверяем корректность цепочек вызовов tool
+    for e in events:
+        if e.get("event_type") == "message_sent":
+            msg = str(e.get("data",{}).get("message",""))
+            if "web_search" in msg or "SEARCH_AGENT" in msg:
+                found = False
+                for e2 in events:
+                    if e2.get("parent_event_id") == e["event_id"] and e2.get("agent_type") == "tool":
+                        found = True
+                        break
+                if not found:
+                    pre_tags[e["event_id"]] = pre_tags.get(e["event_id"], []) + ["missing_tool_result"]
+
+    # Проверяем наличие output в tool_end событиях
+    for e in events:
+        if e.get("event_type","").endswith("_end") and e.get("agent_type") == "tool":
+            if e.get("data",{}).get("output") is None:
+                pre_tags[e["event_id"]] = pre_tags.get(e["event_id"], []) + ["tool_no_output"]
+                
+    return pre_tags
 
 def _build_success_map(trace: Dict[str, Any]) -> Dict[str, bool]:
     """По исходной трассе строим карту: start_event_id -> success (по *_END/TOOL_END)."""
@@ -68,55 +132,323 @@ def _extract_approved_ids(assessed_events: List[Dict[str, Any]]) -> Set[str]:
 # Основная функция LLM-аналитики
 # ──────────────────────────────────────────────────────────────────────────────
 
+
+MODEL_NAME_DEFAULT = "gpt-4o-mini"
+MAX_EVENTS_PER_CHUNK = 30  # оставьте ваше значение
+
 def classify_session_with_llm(
     session_json: Dict[str, Any],
     *,
     model_name: str = MODEL_NAME_DEFAULT,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
-    model: Optional["ChatOpenAI"] = None,
-) -> Dict[str, Any]:
+    model: Optional[Any] = None,
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """
-    Вызывает LLM по чанкам и возвращает словарь:
-    { "events":[{"event_id":..., "assessment":{...}}, ...],
-      "session_assessment": {...} }
-    Если ChatOpenAI недоступен/нет ключа — офлайн-фолбэк: approve по успеху.
-    
-    Для OpenRouter: Укажите base_url="https://openrouter.ai/api/v1", api_key='YOUR_KEY', model_name="qwen/qwen3-4b:free".
+    Возвращает (assessed_dict, token_stats).
+    При любой ошибке провайдера автоматически уходим в офлайн-фолбэк (approve по success).
     """
-    # Фолбэк без LLM: approve=успех (если есть карта успехов в исходной сессии)
-    if model is None or ChatOpenAI is None:
-        # offline: ставим approve "наугад" (или по success, если предоставили карту в session_json)
-        assessed = []
+    def _try_extract_json(text: str) -> Optional[Dict[str, Any]]:
+        """Пробует вытащить JSON из ответа модели (в т.ч. из кодовых блоков)."""
+        if not text:
+            return None
+        # вырежем самый большой JSON-блок
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+
+    def _offline_result() -> Tuple[Dict[str, Any], Dict[str, int]]:
+        success_map = session_json.get("_success_map", {})
+        assessed_events: List[Dict[str, Any]] = []
         for ev in session_json.get("events", []):
-            assessed.append({
-                "event_id": ev.get("event_id"),
-                "assessment": {"verdict": "approve"} if session_json.get("_success_map", {}).get(ev.get("event_id"), True) else {"verdict": "reject"}
+            ev_id = ev.get("event_id")
+            ok = success_map.get(ev_id, True)
+            assessed_events.append({
+                "event_id": ev_id,
+                "assessment": {
+                    "verdict": "approve" if ok else "reject",
+                    "reason": "Offline fallback by success flag"
+                }
             })
-        return {"events": assessed, "session_assessment": {"summary": "Offline fallback: approve by success"}}
+        assessed = {
+            "events": assessed_events,
+            "session_assessment": {
+                "summary": "Offline fallback: approve by success",
+                "improvement_suggestions": [
+                    "Добавьте больше логирования ошибок для агентов.",
+                    "Оптимизируйте последовательность вызовов между агентами.",
+                    "Проверьте валидацию входных данных во всех узлах."
+                ],
+                "expert_review": (
+                    "Сессия в целом прошла успешно. Рекомендуется усилить обработку ошибок и улучшить "
+                    "диагностику причин неуспехов на уровне отдельных агентов/тулов."
+                ),
+            },
+        }
+        return assessed, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-    # Если model не передан, создаем новый с учетом base_url (для OpenRouter)
+    # Если модели нет — сразу фолбэк
     if model is None:
-        if base_url:  # Для OpenRouter или аналогичных
-            if not api_key:
-                raise ValueError("API key required for custom base_url (e.g., OpenRouter)")
-            model = ChatOpenAI(
-                base_url=base_url,
-                api_key=api_key,
-                model=model_name,
-                temperature=0
-            )
-        else:  # Стандартный OpenAI
-            model = ChatOpenAI(
-                model=model_name,
-                temperature=0
-            )
+        return _offline_result()
 
-    # ... (остальной код classify_session_with_llm без изменений: chunks, messages, resp.invoke и т.д.)
+    # helpers
+    def _invoke_with_backoff(_model, _messages, max_retries: int = 4):
+        last = None
+        for attempt in range(max_retries + 1):
+            try:
+                return _model.invoke(_messages)
+            except Exception as e:
+                txt = str(e).lower()
+                # только 429/5xx пытаемся ретраить; всё остальное — отдаём на верхний try/except
+                is_429 = ("rate limit" in txt) or ("429" in txt)
+                is_5xx = any(s in txt for s in ["502", "503", "504"])
+                if not (is_429 or is_5xx):
+                    raise
+                last = e
+                wait = (2 ** attempt) + random.random() * 0.5
+                # уважаем X-RateLimit-Reset если он есть
+                try:
+                    reset_ms = None
+                    if hasattr(e, "response") and getattr(e, "response", None):
+                        hdrs = getattr(e.response, "headers", {}) or {}
+                        reset_ms = int(hdrs.get("X-RateLimit-Reset", "0"))
+                    if reset_ms:
+                        now_ms = int(_time.time() * 1000)
+                        until_reset = max(0, (reset_ms - now_ms) / 1000.0)
+                        wait = max(wait, min(until_reset, 90))
+                except Exception:
+                    pass
+                if attempt < max_retries:
+                    _time.sleep(wait)
+                else:
+                    raise last
+    def _extract_json_block(text: str) -> Optional[dict]:
+        """
+        Пытается вытащить JSON-объект из текста:
+        - ищет первый {...} блок (включая код-блоки ```json ... ```)
+        - безопасно парсит в dict
+        Возвращает dict или None.
+        """
+        if not isinstance(text, str) or not text.strip():
+            return None
+        # Срежем код-блоки
+        fenced = re.search(r"```(?:json)?\s*({.*?})\s*```", text, flags=re.S|re.I)
+        candidate = fenced.group(1) if fenced else None
+        if not candidate:
+            # fallback: первый { ... } блок
+            brace = re.search(r"(\{.*\})", text, flags=re.S)
+            candidate = brace.group(1) if brace else None
+        if not candidate:
+            return None
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+
+    def _coerce_session_assessment(final_text: Any) -> Dict[str, Any]:
+        """
+        Нормализует ответ LLM в объект с ключами summary / improvement_suggestions / expert_review.
+        Принмает либо dict, либо строку.
+        """
+        if isinstance(final_text, dict):
+            # Уже объект — просто нормализуем ключи, если названы иначе
+            summary = final_text.get("summary") or final_text.get("overview") or final_text.get("text") or ""
+            sugg = final_text.get("improvement_suggestions") or final_text.get("recommendations") or []
+            review = final_text.get("expert_review") or final_text.get("analysis") or summary
+            # гарантируем типы
+            if isinstance(sugg, str):
+                sugg = [s.strip("-• ").strip() for s in sugg.splitlines() if s.strip()]
+            return {
+                "summary": str(summary or review or ""),
+                "improvement_suggestions": list(sugg) if isinstance(sugg, list) else [],
+                "expert_review": str(review or summary or "")
+            }
+
+        # Иначе это строка: попробуем вытащить JSON из текста
+        parsed = _extract_json_block(str(final_text))
+        if isinstance(parsed, dict):
+            return _coerce_session_assessment(parsed)
+
+        # Последний вариант: разберём буллеты из текста как рекомендации
+        lines = [ln.strip() for ln in str(final_text).splitlines()]
+        bullets = [ln for ln in lines if re.match(r"^(\-|\*|\d+[\.\)])\s+", ln)]
+        cleaned = [re.sub(r"^(\-|\*|\d+[\.\)])\s+", "", b).strip() for b in bullets]
+        return {
+            "summary": str(final_text).strip(),
+            "improvement_suggestions": [c for c in cleaned if c] if cleaned else [],
+            "expert_review": str(final_text).strip(),
+        }
+    def _extract_usage(resp) -> Dict[str, int]:
+        """
+        Универсальный сбор токенов:
+        - сначала пробуем стандартные места (response_metadata.usage / token_usage),
+        - затем заголовки OpenRouter (x-openrouter-...),
+        - затем «нативные» поля провайдера (tokens_prompt, native_tokens_*), если они прокинуты в метаданные.
+        """
+        prompt = 0
+        completion = 0
+        reasoning = 0
+
+        # 1) Стандартные поля LangChain/OpenAI
+        meta = getattr(resp, "response_metadata", {}) or {}
+        usage = (
+            meta.get("token_usage")
+            or meta.get("usage")
+            or meta.get("openai", {}).get("usage")
+            or {}
+        )
+        def _to_int(x): 
+            try: return int(x)
+            except: return 0
+
+        prompt = _to_int(usage.get("prompt_tokens") or usage.get("input_tokens") or prompt)
+        completion = _to_int(usage.get("completion_tokens") or usage.get("output_tokens") or completion)
+
+        # 2) Заголовки (OpenRouter часто кладёт их туда)
+        headers = meta.get("headers") or {}
+        headers_l = {str(k).lower(): v for k, v in headers.items()} if isinstance(headers, dict) else {}
+
+        prompt = prompt or _to_int(
+            headers_l.get("x-openrouter-prompt-tokens") or
+            headers_l.get("x-openrouter-tokens-prompt")
+        )
+        completion = completion or _to_int(
+            headers_l.get("x-openrouter-completion-tokens") or
+            headers_l.get("x-openrouter-tokens-completion")
+        )
+        reasoning = reasoning or _to_int(
+            headers_l.get("x-openrouter-reasoning-tokens") or
+            headers_l.get("x-openrouter-tokens-reasoning")
+        )
+
+        # 3) «Нативные» поля провайдера (как в вашей метадате Venice)
+        #   иногда провайдерские метаданные попадают в response_metadata под разными ключами;
+        #   обойдём несколько распространённых вариантов.
+        provider_meta = (
+            meta.get("provider_meta") or
+            meta.get("openrouter", {}).get("meta") or
+            meta.get("venice") or
+            meta.get("provider") or
+            {}
+        )
+        if isinstance(provider_meta, dict):
+            prompt = prompt or _to_int(provider_meta.get("tokens_prompt") or provider_meta.get("native_tokens_prompt"))
+            completion = completion or _to_int(provider_meta.get("tokens_completion") or provider_meta.get("native_tokens_completion"))
+            reasoning = reasoning or _to_int(provider_meta.get("native_tokens_reasoning"))
+
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "reasoning_tokens": reasoning,
+            "total_tokens": prompt + completion + reasoning,
+        }
+
+    # prechecks (не критично)
+    try:
+        pre_tags = run_prechecks(session_json)
+    except Exception:
+        pre_tags = {}
+
+    system_prompt = (
+        "You are an expert auditor for multi-agent execution traces. "
+        "For each event in the provided JSON list, produce an assessment object with keys: "
+        "'verdict' (approve|reject|uncertain), 'categories' (list of error categories), "
+        "'severity' (low|medium|high), 'confidence' (0.0-1.0), 'explanation', 'suggested_fix'. "
+        "Return JSON only: {events:[{event_id:..., assessment:{...}}], session_assessment:{...}}. "
+        "Use the precheck hints when present."
+    )
+
+    events = session_json.get("events", [])
+    chunk_size = MAX_EVENTS_PER_CHUNK
+    event_chunks = [events[i:i + chunk_size] for i in range(0, len(events), chunk_size)]
+
+    assessed_events: List[Dict[str, Any]] = []
+    chunk_assessments: List[str] = []
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    # Основной цикл по чанкам — защищаем каждый вызов
+    for chunk in event_chunks:
+        try:
+            chunk_json = json.dumps(chunk, ensure_ascii=False, indent=2)
+            preface = f"Precheck hints: {json.dumps(pre_tags, ensure_ascii=False)}\n\n" if pre_tags else ""
+            human_prompt = (
+                f"{preface}Analyze this chunk of events. "
+                f"For each event provide a verdict (approve/reject/uncertain) and short reason:\n{chunk_json}"
+            )
+            messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            resp = _invoke_with_backoff(model, messages, max_retries=4)
+            text = resp.content if hasattr(resp, "content") else str(resp)
+            usage = _extract_usage(resp)
+            total_prompt_tokens += usage["prompt_tokens"]
+            total_completion_tokens += usage["completion_tokens"]
+            reasoning_here = usage.get("reasoning_tokens", 0)
+        except Exception as e:
+            # Любая ошибка (включая JSONDecodeError внутри SDK) — полный офлайн-фолбэк
+            print(f"[LLM chunk error] {e}. Falling back to offline.")
+            return _offline_result()
+
+        lower = text.lower()
+        for ev in chunk:
+            ev_id = ev.get("event_id")
+            verdict = "approve" if ("approve" in lower and "reject" not in lower) else "reject"
+            assessed_events.append({
+                "event_id": ev_id,
+                "assessment": {
+                    "verdict": verdict,
+                    "explanation": "LLM chunk analysis (heuristic parse)"
+                }
+            })
+        chunk_assessments.append(text)
+
+    # Финальный сводный запрос — тоже под защитой
+    try:
+        final_prompt = (
+            "Given the analyses above, provide a concise overall session assessment and 3 improvement suggestions."
+        )
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=final_prompt + "\n\nPrevious analyses:\n" + "\n".join(chunk_assessments)),
+        ]
+        final_resp = _invoke_with_backoff(model, messages, max_retries=4)
+        final_text = final_resp.content if hasattr(final_resp, "content") else str(final_resp)
+        usage = _extract_usage(final_resp)
+        total_prompt_tokens += usage["prompt_tokens"]
+        total_completion_tokens += usage["completion_tokens"]
+        reasoning_here = usage.get("reasoning_tokens", 0)
+    except Exception as e:
+        print(f"[LLM final error] {e}. Falling back to offline.")
+        return _offline_result()
+    
+    session_assessment = _coerce_session_assessment(final_text)
+    
+    if not session_assessment.get("improvement_suggestions"):
+        session_assessment["improvement_suggestions"] = [
+            "Optimize agent communication patterns.",
+            "Implement stricter error handling and retries for tools.",
+            "Add richer telemetry to trace bottlenecks and failures.",
+        ]
+    assessed = {"events": assessed_events, "session_assessment": session_assessment}
+    token_stats = {
+        "prompt_tokens": total_prompt_tokens,
+        "completion_tokens": total_completion_tokens,
+        # reasoning копим по месту, если провайдер его отдаёт (см. _extract_usage)
+        "reasoning_tokens": 0,
+        "total_tokens": total_prompt_tokens + total_completion_tokens,
+    }
+
+    return assessed, token_stats
+
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Утилита интеграции со Streamlit: анализ «байтов» файла
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def analyze_trace_bytes(
     trace_bytes: bytes,
@@ -125,27 +457,91 @@ def analyze_trace_bytes(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     use_llm: bool = True
-) -> Tuple[bytes, Set[str]]:
+) -> Tuple[bytes, Set[str], Dict[str, int]]:
     """
-    Принимает байты исходного файла трассы, возвращает:
-    (байты нового JSON (с assessments), set(approved_event_id))
+    Возвращает (байты нового JSON, set(approved_event_id), token_stats)
     """
     trace = json.loads(trace_bytes.decode("utf-8"))
     session_view = _session_view_from_trace(trace)
-
-    # в офлайне для эвристики передадим success-карту
     session_view["_success_map"] = _build_success_map(trace)
 
+    # --- подготовка LLM ---
+    def _normalize_base_url(url: Optional[str]) -> Optional[str]:
+        if not url:
+            return None
+        u = url.rstrip("/")
+        # для OpenRouter гарантируем /api/v1
+        if "openrouter.ai" in u and not u.endswith("/api/v1") and not u.endswith("/v1"):
+            return u + "/api/v1"
+        return u
+
+    def _maybe_fix_model_for_openrouter(mname: str, burl: Optional[str]) -> str:
+        if not mname:
+            return MODEL_NAME_DEFAULT
+        if burl and "openrouter.ai" in burl and "/" not in mname:
+            # OpenRouter требует провайдер/модель, например: openai/gpt-4o-mini
+            return f"openai/{mname}"
+        return mname
+
     model = None
-    if use_llm and ChatOpenAI is not None and os.getenv("OPENAI_API_KEY"):
-        model = ChatOpenAI(model=model_name, temperature=0)
+    token_stats = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-    assessed = classify_session_with_llm(session_view, model_name=model_name, base_url=base_url, api_key=api_key, model=model)
-    approved_ids = _extract_approved_ids(assessed["events"])
+    if use_llm and ("ChatOpenAI" in globals()) and (ChatOpenAI is not None):
+        # не затираем вручную: используем переданное или окружение
+        base_url = _normalize_base_url(base_url or os.getenv("LLM_BASE_URL"))
+        # если явно на OpenRouter — возьмём OPENROUTER_API_KEY приоритетно
+        api_key = (
+            api_key
+            or (os.getenv("OPENROUTER_API_KEY") if (base_url and "openrouter.ai" in base_url) else None)
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("OPENROUTER_API_KEY")
+        )
+        model_name = _maybe_fix_model_for_openrouter(model_name or os.getenv("LLM_MODEL") or MODEL_NAME_DEFAULT, base_url)
 
-    # собираем новый JSON: копия трассы + блок assessments
+        if api_key:
+            print(f"Initializing LLM with model={model_name}, base_url={base_url or 'default'}")
+            kwargs = {
+                "model": model_name,
+                "temperature": 0,
+                "api_key": api_key,
+            }
+            if base_url:
+                kwargs["base_url"] = base_url
+            if base_url and "openrouter.ai" in base_url:
+                kwargs["default_headers"] = {
+                    "HTTP-Referer": "http://localhost",
+                    "X-Title": "Tracing & Log Viz",
+                }
+            try:
+                model = ChatOpenAI(**kwargs)
+            except Exception as e:
+                # не даём упасть — уйдём в офлайн
+                print(f"[LLM init error] {e}. Using offline fallback.")
+                model = None
+        else:
+            print("API key not provided. Using offline fallback.")
+
+    # --- анализ ---
+    assessed, _token_stats = classify_session_with_llm(
+        session_view,
+        model_name=model_name,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+    )
+
+    token_stats = {
+        "total_prompt_tokens": int(_token_stats.get("prompt_tokens", 0)),
+        "total_completion_tokens": int(_token_stats.get("completion_tokens", 0)),
+        "total_reasoning_tokens": int(_token_stats.get("reasoning_tokens", 0)),
+        "total_tokens": int(_token_stats.get("total_tokens", 0)),
+    }
+
+    approved_ids = _extract_approved_ids(assessed.get("events", []))
+
     new_trace = trace.copy()
     new_trace["assessments"] = assessed
+    new_trace["token_stats"] = token_stats
 
     out_bytes = json.dumps(new_trace, ensure_ascii=False, indent=2).encode("utf-8")
-    return out_bytes, approved_ids
+    return out_bytes, approved_ids, token_stats

@@ -334,7 +334,7 @@ class MultiAgentTracer:
     def _build_aggregated_graph(
         self,
         include_types: Optional[Set[str]] = None,
-        hide_http_tools: bool = False,  # оставлено для совместимости; http/tool уже очищены в rebuild
+        hide_http_tools: bool = False,
         group_by: str = "agent_name",
     ) -> nx.DiGraph:
         """
@@ -360,31 +360,44 @@ class MultiAgentTracer:
 
         # 1) агрегируем узлы
         bag: Dict[str, Dict[str, Any]] = {}
-        for _, nd in G.nodes(data=True):
+        for node_id, nd in G.nodes(data=True):
             k = key_of(nd)
             if not k:
                 continue
             b = bag.setdefault(k, {
                 "agent_name": k if group_by == "agent_name" else nd.get("agent_name", k),
                 "agent_type": nd.get("agent_type", "custom") if group_by == "agent_type" else "custom",
-                "count": 0, "durations": [], "successes": []
+                "count": 0, 
+                "durations": [], 
+                "successes": [],
+                "approved_list": []  # ← ДОБАВЛЕНО: собираем метки approved
             })
             b["count"] += 1
             if nd.get("duration") is not None:
                 b["durations"].append(float(nd["duration"]))
             if "success" in nd:
                 b["successes"].append(bool(nd["success"]))
+            if "approved" in nd:  # ← ДОБАВЛЕНО: собираем метки approved
+                b["approved_list"].append(bool(nd["approved"]))
 
         for k, b in bag.items():
             avg_dur = sum(b["durations"]) / len(b["durations"]) if b["durations"] else None
             succ = sum(b["successes"]) / len(b["successes"]) if b["successes"] else None
+            
+            # ← ДОБАВЛЕНО: вычисляем агрегированное значение approved
+            approved = None
+            if b["approved_list"]:
+                # Если хотя бы один узел имеет approved=True, считаем всю группу approved
+                approved = any(b["approved_list"])
+            
             H.add_node(
                 k,
                 agent_name=b["agent_name"],
                 agent_type=b["agent_type"] if group_by == "agent_type" else "custom",
                 count=b["count"],
                 duration=avg_dur,
-                success=True if succ is None else succ
+                success=True if succ is None else succ,
+                approved=approved  # ← ДОБАВЛЕНО: передаем агрегированную метку
             )
 
         # 2) агрегируем рёбра
@@ -602,9 +615,9 @@ class MultiAgentTracer:
                     showlegend=False,
                 )
             )
-            if nd.get("approved"):
+            if nd.get("approved"):  # ← Теперь работает и для агрегированного режима
                 approve_annotations.append(dict(
-                    x=x, y=y + (node_size/80.0),
+                    x=x, y=y + (node_size/60.0),
                     xref="x", yref="y",
                     text="approve ✅",
                     showarrow=False,
