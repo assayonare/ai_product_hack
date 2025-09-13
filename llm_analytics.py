@@ -19,7 +19,7 @@ except Exception as e:
 # Также умеет работать в офлайн-фолбэке (без API-ключа) — проставляет approve=успех.
 
 
-MODEL_NAME_DEFAULT = os.getenv("LLM_MODEL", "gpt-4o-mini")
+MODEL_NAME_DEFAULT = os.getenv("LLM_MODEL", "qwen/qwen3-4b:free")
 MAX_EVENTS_PER_CHUNK = 12  # оптимальный размер чанка
 
 # JSON Schema для валидации ответов LLM
@@ -131,9 +131,6 @@ def _extract_approved_ids(assessed_events: List[Dict[str, Any]]) -> Set[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Основная функция LLM-аналитики
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-MODEL_NAME_DEFAULT = "gpt-4o-mini"
 MAX_EVENTS_PER_CHUNK = 30  # оставьте ваше значение
 
 def classify_session_with_llm(
@@ -375,10 +372,16 @@ def classify_session_with_llm(
     for chunk in event_chunks:
         try:
             chunk_json = json.dumps(chunk, ensure_ascii=False, indent=2)
-            preface = f"Precheck hints: {json.dumps(pre_tags, ensure_ascii=False)}\n\n" if pre_tags else ""
             human_prompt = (
-                f"{preface}Analyze this chunk of events. "
-                f"For each event provide a verdict (approve/reject/uncertain) and short reason:\n{chunk_json}"
+                "You are scoring multi-agent trace events.\n"
+                "Return STRICT JSON only with shape:\n"
+                '{ "events": [ { "event_id": "<id from input>", '
+                '"assessment": { "verdict": "approve|reject|uncertain", '
+                '"categories": [], "severity": "low|medium|high", '
+                '"confidence": 0.0, "explanation": "", "suggested_fix": "" } } ] }\n'
+                "Do not include any extra text.\n\n"
+                f"Precheck hints: {json.dumps(pre_tags, ensure_ascii=False)}\n\n"
+                f"Events:\n{chunk_json}"
             )
             messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
             resp = _invoke_with_backoff(model, messages, max_retries=4)
@@ -386,29 +389,81 @@ def classify_session_with_llm(
             usage = _extract_usage(resp)
             total_prompt_tokens += usage["prompt_tokens"]
             total_completion_tokens += usage["completion_tokens"]
-            reasoning_here = usage.get("reasoning_tokens", 0)
-        except Exception as e:
-            # Любая ошибка (включая JSONDecodeError внутри SDK) — полный офлайн-фолбэк
-            print(f"[LLM chunk error] {e}. Falling back to offline.")
-            return _offline_result()
 
-        lower = text.lower()
+            obj = _extract_json_block(text) or _try_extract_json(text)
+            chunk_assessed: Dict[str, Dict[str, Any]] = {}
+
+            if isinstance(obj, dict):
+                # (опционально) строгая валидация — если есть jsonschema
+                # try: validate(instance=obj, schema=OUTPUT_SCHEMA)
+                # except Exception: obj = None
+
+                for item in obj.get("events", []):
+                    eid = (item or {}).get("event_id")
+                    a = (item or {}).get("assessment") or {}
+                    if isinstance(eid, str) and isinstance(a, dict):
+                        # нормализация полей
+                        verdict = str(a.get("verdict", "")).lower()
+                        if verdict not in {"approve", "reject", "uncertain"}:
+                            verdict = "uncertain"
+
+                        cats = a.get("categories", [])
+                        if isinstance(cats, str):
+                            cats = [c.strip() for c in re.split(r"[,\n;]+", cats) if c.strip()]
+                        elif not isinstance(cats, list):
+                            cats = []
+
+                        sev = str(a.get("severity", "low")).lower()
+                        if sev not in {"low", "medium", "high"}:
+                            sev = "low"
+
+                        try:
+                            conf = float(a.get("confidence", 0.5))
+                        except Exception:
+                            conf = 0.5
+                        conf = max(0.0, min(1.0, conf))
+
+                        chunk_assessed[eid] = {
+                            "verdict": verdict,
+                            "categories": cats,
+                            "severity": sev,
+                            "confidence": conf,
+                            "explanation": a.get("explanation", ""),
+                            "suggested_fix": a.get("suggested_fix", ""),
+                        }
+
+            # ← ЭТОГО НЕ ХВАТАЛО: сохраняем «результат чанка» для финального summary
+            chunk_assessments.append(
+                json.dumps(obj, ensure_ascii=False) if isinstance(obj, dict) else text
+            )
+
+        except Exception as e:
+            print(f"[LLM chunk error] {e}. Falling back to offline.")
+            # если хотим мгновенный оффлайн — return _offline_result()
+            # либо continue с эвристикой ↓
+
+        # Сопоставляем оценки по event_id; мягкий фолбэк для пропусков
         for ev in chunk:
             ev_id = ev.get("event_id")
-            verdict = "approve" if ("approve" in lower and "reject" not in lower) else "reject"
-            assessed_events.append({
-                "event_id": ev_id,
-                "assessment": {
-                    "verdict": verdict,
-                    "explanation": "LLM chunk analysis (heuristic parse)"
-                }
-            })
-        chunk_assessments.append(text)
+            a = chunk_assessed.get(ev_id)
+            if a:
+                assessed_events.append({"event_id": ev_id, "assessment": a})
+            else:
+                assessed_events.append({
+                    "event_id": ev_id,
+                    "assessment": {
+                        "verdict": "uncertain",
+                        "explanation": "Heuristic fallback (no JSON for this id)"
+                    }
+                })
 
     # Финальный сводный запрос — тоже под защитой
     try:
         final_prompt = (
-            "Given the analyses above, provide a concise overall session assessment and 3 improvement suggestions."
+            "Return STRICT JSON only with shape:\n"
+            '{ "summary": "...", "improvement_suggestions": ["...","...","..."], "expert_review": "..." }.\n'
+            "Do not include any extra text.\n\n"
+            "Given the analyses above:"
         )
         messages = [
             SystemMessage(content=system_prompt),
