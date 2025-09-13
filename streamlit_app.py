@@ -22,7 +22,6 @@ def start_agents():
     
     if not st.session_state.agents_started:
         try:
-            # Проверяем, запущены ли уже агенты
             try:
                 response = requests.get("http://localhost:8000/health", timeout=2)
                 if response.status_code == 200:
@@ -33,8 +32,7 @@ def start_agents():
                 pass
             
             st.sidebar.info("🚀 Запускаем агентскую систему...")
-            
-            # Команды для запуска каждого агента
+
             commands = [
                 ["uvicorn", "agent_with_orchestrator:orchestrator_app", "--host", "0.0.0.0", "--port", "8000", "--reload"],
                 ["uvicorn", "agent_with_orchestrator:search_app", "--host", "0.0.0.0", "--port", "8001", "--reload"],
@@ -45,7 +43,6 @@ def start_agents():
             processes = []
             for cmd in commands:
                 try:
-                    # Запускаем каждый процесс в фоне
                     process = subprocess.Popen(
                         cmd,
                         stdout=subprocess.DEVNULL,
@@ -53,7 +50,7 @@ def start_agents():
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
                     )
                     processes.append(process)
-                    time.sleep(2)  # Пауза между запусками
+                    time.sleep(2)  
                 except Exception as e:
                     st.sidebar.error(f"Ошибка запуска агента: {e}")
                     continue
@@ -61,8 +58,7 @@ def start_agents():
             st.session_state.agent_processes = processes
             st.session_state.agents_started = True
             time.sleep(5)
-            
-            # Проверяем здоровье агентов
+
             healthy = check_agents_health()
             if healthy:
                 st.sidebar.success("✅ Агенты успешно запущены!")
@@ -111,7 +107,6 @@ def stop_agents():
         st.session_state.agents_started = False
         st.sidebar.info("🛑 Агенты остановлены")
 
-# Запускаем агентов при старте
 agents_ready = start_agents()
 
 if not agents_ready:
@@ -124,7 +119,6 @@ if not agents_ready:
     3. Проверьте, что порты 8000-8003 свободны
     """)
 
-# В sidebar после формы параметров добавьте:
 st.sidebar.markdown("---")
 if st.sidebar.button("🩺 Проверить здоровье агентов"):
     check_agents_health()
@@ -193,13 +187,13 @@ if "label_font_size" not in ss:
 
 # загруженные файлы
 if "uploaded_buffers" not in ss:
-    ss.uploaded_buffers = {}   # filename -> bytes
+    ss.uploaded_buffers = {}   
 if "selected_file" not in ss:
     ss.selected_file = None
 
 # метки LLM
 if "llm_labels" not in ss:
-    ss.llm_labels = {}         # agent_name -> True/False (approve)
+    ss.llm_labels = {}        
 if "show_approve" not in ss:
     ss.show_approve = True
 
@@ -250,7 +244,6 @@ async def send_to_orchestrator_async(prompt: str) -> Dict[str, Any]:
 def send_to_orchestrator(prompt: str) -> Dict[str, Any]:
     """Синхронная обертка для асинхронной отправки"""
     try:
-        # Сначала проверяем, доступен ли оркестратор
         response = requests.get("http://localhost:8000/health", timeout=3)
         if response.status_code != 200:
             return {"error": "Оркестратор недоступен. Запустите агенты сначала."}
@@ -300,7 +293,6 @@ if submit_prompt:
                     ss.agent_trace_id = response.get("trace_id")
                     st.success("Запрос успешно обработан!")
                     
-                    # Показываем результат
                     with st.expander("📋 Результат выполнения", expanded=True):
                         st.markdown('<div class="response-box">', unsafe_allow_html=True)
                         st.write("**Финальный результат:**")
@@ -314,15 +306,13 @@ if submit_prompt:
                                 st.markdown(f"**Шаг {step['step']} - {step['agent']}**")
                                 st.text(f"Вход: {step.get('input', '')[:200]}...")
                                 st.text(f"Выход: {step.get('output', '')[:200]}...")
-                    
-                    # Сохраняем trace_id для возможной загрузки трассы
+
                     if ss.agent_trace_id:
                         st.info(f"Trace ID: {ss.agent_trace_id}")
                         
             except Exception as e:
                 st.error(f"Ошибка при выполнении запроса: {str(e)}")
 
-# Показываем предыдущий ответ, если есть
 if ss.agent_response and "error" not in ss.agent_response:
     with st.expander("📋 Предыдущий результат", expanded=False):
         st.markdown('<div class="response-box">', unsafe_allow_html=True)
@@ -356,33 +346,28 @@ def merge_traces(trace_files: Dict[str, bytes]) -> bytes:
         try:
             data = json.loads(content.decode('utf-8'))
             
-            # Берем session_id из первого файла
             if session_id is None and 'session_id' in data:
                 session_id = data['session_id']
-            
-            # Объединяем события
+
             if 'events' in data:
                 merged_events.extend(data['events'])
                 merged_stats["total_events"] += len(data['events'])
-            
-            # Объединяем статистику по агентам
+
             if 'stats' in data and 'agents' in data['stats']:
                 for agent_name, agent_stats in data['stats']['agents'].items():
                     if agent_name not in merged_stats["agents"]:
                         merged_stats["agents"][agent_name] = agent_stats
                     else:
-                        # Суммируем метрики для одинаковых агентов
                         merged_stats["agents"][agent_name]["calls"] += agent_stats.get("calls", 0)
                         merged_stats["agents"][agent_name]["total_duration"] += agent_stats.get("total_duration", 0)
                         merged_stats["agents"][agent_name]["errors"] += agent_stats.get("errors", 0)
-                        # Пересчитываем среднюю длительность
+
                         if agent_stats.get("calls", 0) > 0:
                             merged_stats["agents"][agent_name]["avg_duration"] = (
                                 merged_stats["agents"][agent_name]["total_duration"] / 
                                 merged_stats["agents"][agent_name]["calls"]
                             )
-            
-            # Объединяем общую статистику
+
             if 'stats' in data:
                 merged_stats["session_duration"] = max(
                     merged_stats["session_duration"], 
@@ -394,10 +379,8 @@ def merge_traces(trace_files: Dict[str, bytes]) -> bytes:
             print(f"Ошибка при обработке файла {filename}: {e}")
             continue
     
-    # Сортируем события по timestamp
     merged_events.sort(key=lambda x: x.get('timestamp', 0))
-    
-    # Создаем объединенный результат
+
     merged_data = {
         "session_id": session_id or f"merged_session_{int(time.time())}",
         "events": merged_events,
@@ -414,11 +397,9 @@ if uploaded_files:
             ss.uploaded_buffers[up.name] = up.getvalue()
             st.success(f"Файл загружен: {up.name}")
 
-# Выбор файла
 if ss.uploaded_buffers:
     ss.selected_file = st.selectbox("Выберите файл для просмотра", options=list(ss.uploaded_buffers.keys()))
-    
-    # Кнопка для объединения всех загруженных трасс
+
     if st.button("🔄 Объединить все трассы в один файл"):
         with st.spinner("Объединяем трассы..."):
             merged_content = merge_traces(ss.uploaded_buffers)
@@ -427,7 +408,6 @@ if ss.uploaded_buffers:
             ss.selected_file = merged_filename
             st.success(f"✅ Трассы объединены в файл: {merged_filename}")
 
-# Форма параметров и построение графа
 with st.sidebar:
     
     st.subheader("⚙️ Параметры визуализации")
@@ -465,7 +445,6 @@ with st.sidebar:
                 ss.label_font_size = label_font_size
                 st.success("Граф построен по новым параметрам.")
 
-# Tabs
 tabs = st.tabs(["🕸️ Граф вызовов", "⏱️ Диаграмма последовательности", "📈 Таймлайн", "🤖 LLM-аналитик"])
 
 with tabs[0]:
@@ -539,7 +518,7 @@ with tabs[3]:
     )
 
     use_llm = st.toggle("Использовать LLM (если нет — оффлайн фолбэк)", value=True)
-    # Параметры LLM берутся из .env
+
 
     col_a, col_b = st.columns([1, 1])
     run_clicked = col_a.button("🔍 Запустить аналитика на выбранном файле")
@@ -550,7 +529,7 @@ with tabs[3]:
             try:
                 base = ss.selected_file.rsplit(".json", 1)[0]
                 new_name = f"{base}__assessed.json"
-                # если уже есть — добавим приписку
+
                 if new_name in ss.uploaded_buffers:
                     new_name = f"{base}__assessed_{int(time.time())}.json"
 
@@ -572,23 +551,19 @@ with tabs[3]:
                     #     base_url=os.getenv("LLM_BASE_URL"),
                     #     api_key=os.getenv("OPENAI_API_KEY")
                     # )
-                    # сохраняем в «загруженные»
                     ss.uploaded_buffers[new_name] = new_bytes
                     ss.selected_file = new_name
 
-                    # Распарсить новый JSON для отображения мыслей LLM
                     new_trace = json.loads(new_bytes.decode("utf-8"))
                     assessments = new_trace.get("assessments", {})
                     session_assessment = assessments.get("session_assessment", {})
                     assessed_events = assessments.get("events", [])
 
-                    # Собираем tracer по новому файлу
                     t = MultiAgentTracer(session_id="streamlit_viewer")
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
                         tmp.write(new_bytes); tmp.flush(); t.load_traces(tmp.name)
                     os.unlink(tmp.name)
 
-                    # проставляем approve узлам по event_id
                     G = t.call_graph
                     for nid in G.nodes():
                         if nid in approved_ids:
@@ -596,7 +571,6 @@ with tabs[3]:
 
                     ss.ma_tracer = t
 
-                # перерисовываем граф
                 fig_graph = polish_plotly(ss.ma_tracer.get_call_graph_viz(
                     mode=("aggregated" if ss.graph_mode == "Aggregated" else "invocations"),
                     include_types=set(ss.include_types),
@@ -618,9 +592,9 @@ with tabs[3]:
                 st.success(f"Новый файл создан и подгружен: {new_name}")
                 col_b.download_button("⬇️ Скачать новый JSON", data=new_bytes, file_name=new_name, mime="application/json")
 
-                # Отображение мыслей LLM и статистики токенов
+
                 with st.expander("🧠 Мысли LLM о сессии", expanded=True):
-                    # Показываем статистику токенов если использовалась LLM
+
                     if use_llm:
                         col1, col2, col3 = st.columns(3)
                         with col1:
@@ -644,7 +618,7 @@ with tabs[3]:
 
                 with st.expander("📋 Детальный анализ событий LLM"):
                     if assessed_events:
-                        # Создаем мапу событий по id для быстрого доступа
+
                         events_map = {e.get("event_id"): e for e in new_trace.get("events", [])}
                         
                         events_df = pd.DataFrame([
@@ -661,14 +635,14 @@ with tabs[3]:
                             }
                             for ev in assessed_events
                         ])
-                        # Убираем пустые столбцы tool если инструментов нет
+
                         if events_df["tool"].isna().all() or (events_df["tool"] == "").all():
                             events_df = events_df.drop(columns=["tool"])
                         st.dataframe(events_df, use_container_width=True)
                     else:
                         st.info("Нет детального анализа событий от LLM.")
 
-                # Просмотр исходного файла
+
                 with st.expander("📄 Исходный файл (raw JSON)"):
                     original_bytes = ss.uploaded_buffers.get(base + ".json") or ss.uploaded_buffers[ss.selected_file]  # Берем оригинал по имени
                     if original_bytes:

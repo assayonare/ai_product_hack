@@ -76,16 +76,14 @@ class MultiAgentTracer:
     ):
         self.session_id = session_id or str(uuid.uuid4())
         self.events: List[TraceEvent] = []
-        self.active_events: Dict[str, TraceEvent] = {}  # ключ: event_id из *_START
-        self.lock = None  # не обязателен в Streamlit; если нужен - импортируй threading.Lock()
+        self.active_events: Dict[str, TraceEvent] = {}  
+        self.lock = None  
         self.log_file = log_file
         self.enable_real_time_viz = enable_real_time_viz
         self.llm_classifier = llm_classifier
 
-        # Базовый граф вызовов (invocations)
         self.call_graph = nx.DiGraph()
 
-        # Логирование
         if log_file:
             logging.basicConfig(
                 filename=log_file,
@@ -134,7 +132,6 @@ class MultiAgentTracer:
         self.active_events[event_id] = ev
         self._append_event(ev)
 
-        # Нода в графе
         self.call_graph.add_node(
             event_id,
             agent_name=agent_name,
@@ -165,7 +162,6 @@ class MultiAgentTracer:
         )
         self._append_event(end_ev)
 
-        # Обновим атрибуты ноды
         if start_event_id in self.call_graph:
             self.call_graph.nodes[start_event_id]["duration"] = duration
             self.call_graph.nodes[start_event_id]["success"] = success
@@ -200,7 +196,6 @@ class MultiAgentTracer:
         self.active_events[event_id] = ev
         self._append_event(ev)
 
-        # Узел инструмента
         self.call_graph.add_node(
             event_id,
             agent_name=f"{agent_name}::{tool_name}",
@@ -233,13 +228,11 @@ class MultiAgentTracer:
         )
         self._append_event(ev)
 
-        # Обновим атрибуты ноды
         if start_event_id in self.call_graph:
             self.call_graph.nodes[start_event_id]["duration"] = duration
             self.call_graph.nodes[start_event_id]["success"] = success
             self.call_graph.nodes[start_event_id]["end_time"] = now
 
-    # Совместимость: старый короткий one-shot лог
     def log_tool_call(
         self,
         agent_name: str,
@@ -313,7 +306,6 @@ class MultiAgentTracer:
                 if v in visible:
                     H.add_edge(src, v, weight=H.get_edge_data(src, v, {}).get("weight", 0) + 1)
                 else:
-                    # разворачиваем цепочку скрытых узлов
                     stack = [v]
                     seen = set()
                     while stack:
@@ -355,10 +347,10 @@ class MultiAgentTracer:
                 return None
             if group_by == "agent_type":
                 return at
-            # имена уже канонизированы на этапе rebuild
+            
             return str(nd.get("agent_name", "unknown"))
 
-        # 1) агрегируем узлы
+
         bag: Dict[str, Dict[str, Any]] = {}
         for node_id, nd in G.nodes(data=True):
             k = key_of(nd)
@@ -370,24 +362,22 @@ class MultiAgentTracer:
                 "count": 0, 
                 "durations": [], 
                 "successes": [],
-                "approved_list": []  # ← ДОБАВЛЕНО: собираем метки approved
+                "approved_list": [] 
             })
             b["count"] += 1
             if nd.get("duration") is not None:
                 b["durations"].append(float(nd["duration"]))
             if "success" in nd:
                 b["successes"].append(bool(nd["success"]))
-            if "approved" in nd:  # ← ДОБАВЛЕНО: собираем метки approved
+            if "approved" in nd:  
                 b["approved_list"].append(bool(nd["approved"]))
 
         for k, b in bag.items():
             avg_dur = sum(b["durations"]) / len(b["durations"]) if b["durations"] else None
             succ = sum(b["successes"]) / len(b["successes"]) if b["successes"] else None
             
-            # ← ДОБАВЛЕНО: вычисляем агрегированное значение approved
             approved = None
             if b["approved_list"]:
-                # Если хотя бы один узел имеет approved=True, считаем всю группу approved
                 approved = any(b["approved_list"])
             
             H.add_node(
@@ -397,10 +387,9 @@ class MultiAgentTracer:
                 count=b["count"],
                 duration=avg_dur,
                 success=True if succ is None else succ,
-                approved=approved  # ← ДОБАВЛЕНО: передаем агрегированную метку
+                approved=approved  
             )
 
-        # 2) агрегируем рёбра
         for u, v in G.edges():
             nu, nv = key_of(G.nodes[u]), key_of(G.nodes[v])
             if nu and nv and nu != nv:
@@ -414,12 +403,12 @@ class MultiAgentTracer:
         """Единый канонический вид имени для всех представлений."""
         if not name:
             return "unknown"
-        # убираем http_call::*
+
         if name.startswith("http_call::"):
             name = name[len("http_call::"):]
-        # убираем суффиксы после :: (например ::HTTP POST)
+
         name = name.split("::")[0]
-        # убираем /execute и прочие суффиксы после /
+
         name = name.split("/")[0]
         return name
 
@@ -450,19 +439,18 @@ class MultiAgentTracer:
     def get_call_graph_viz(
         self,
         output_file: Optional[str] = None,
-        mode: str = "invocations",  # "aggregated" | "invocations"
+        mode: str = "invocations",  
         include_types: Optional[Set[str]] = None,
         hide_http_tools: bool = False,
         group_by: str = "agent_name",
         edge_width_scale: float = 2.0,
         arrow_size: float = 2.0,
-        height: int = 900,             # <<< новая высота по умолчанию
-        label_font_size: int = 12       # <<< размер шрифта меток узлов
+        height: int = 900,             
+        label_font_size: int = 12      
     ) -> go.Figure:
         if not self.call_graph.nodes():
             return go.Figure()
 
-        # --- вспомогательная функция контраста текста с цветом узла
         def _label_color_for(hex_color: str) -> str:
             try:
                 hex_color = hex_color.lstrip('#')
@@ -476,7 +464,7 @@ class MultiAgentTracer:
                 return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 
             R, G, B = _linear(r), _linear(g), _linear(b)
-            # относительная яркость по WCAG
+
             L = 0.2126 * R + 0.7152 * G + 0.0722 * B
             return "black" if L > 0.6 else "white"
 
@@ -526,14 +514,13 @@ class MultiAgentTracer:
         }
         arrow_annotations = []
         approve_annotations = [] 
-        # 1) линии рёбер + стрелочные аннотации поверх
+
         for u, v in graph.edges():
             x0, y0 = pos[u]
             x1, y1 = pos[v]
             edge_success = graph.nodes[v].get("success", True)
             edge_color = "#2ECC71" if edge_success else "#E74C3C"
 
-        # линия ребра (под узлами — ок)
             fig.add_trace(
                 go.Scatter(
                     x=[x0, x1],
@@ -545,19 +532,18 @@ class MultiAgentTracer:
                 )
             )
 
-            # стрелка поверх: аннотация с «arrowhead»
             arrow_annotations.append(
                 dict(
                     x=x1, y=y1, ax=x0, ay=y0,
                     xref="x", yref="y", axref="x", ayref="y",
                     arrowhead=3, arrowsize=arrow_size, arrowwidth=2,
                     arrowcolor=edge_color, opacity=0.95,
-                    standoff=12  # чтобы наконечник не утыкался в центр узла
+                    standoff=12  
                 )
             )
 
         
-        # 3) узлы
+
         for n in graph.nodes():
             x, y = pos[n]
             nd = graph.nodes[n]
@@ -574,7 +560,7 @@ class MultiAgentTracer:
 
             node_color = color_map.get(agent_type, "#98D8C8")
             node_symbol = symbol_map.get(agent_type, "circle")
-            text_color = _label_color_for(node_color)  # <<< авто-выбор цвета текста
+            text_color = _label_color_for(node_color)  
             line_color = "#E74C3C" if not success else "white"
             line_width = 4 if not success else 2
 
@@ -615,7 +601,7 @@ class MultiAgentTracer:
                     showlegend=False,
                 )
             )
-            if nd.get("approved"):  # ← Теперь работает и для агрегированного режима
+            if nd.get("approved"):  
                 approve_annotations.append(dict(
                     x=x, y=y + (node_size/60.0),
                     xref="x", yref="y",
@@ -629,7 +615,6 @@ class MultiAgentTracer:
                     opacity=0.95,
                 ))
 
-        # 4) легенда
         for at, color in color_map.items():
             fig.add_trace(
                 go.Scatter(
@@ -671,7 +656,7 @@ class MultiAgentTracer:
             xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             plot_bgcolor="rgba(240,240,240,0.8)",
-            height=height,   # <<< увеличенная высота
+            height=height,   
             annotations=annotations,
         )
 
@@ -686,7 +671,6 @@ class MultiAgentTracer:
         if not self.events:
             return go.Figure()
 
-        # индексы START/END
         starts: Dict[str, TraceEvent] = {}
         ends_by_parent: Dict[str, TraceEvent] = {}
         for e in self.events:
@@ -695,14 +679,12 @@ class MultiAgentTracer:
             elif e.event_type in (EventType.AGENT_END, EventType.TOOL_END) and e.parent_event_id:
                 ends_by_parent[e.parent_event_id] = e
 
-        # видимые старты (те же правила, что в rebuild)
         visible_start_ids: Set[str] = set()
         for sid, s in starts.items():
             if self._is_http_wrapper_start(s) or self._is_ephemeral_step(s, ends_by_parent):
                 continue
             visible_start_ids.add(sid)
 
-        # сгруппируем по каноническим именам: учитываем ТОЛЬКО видимые START/END
         evs_sorted = sorted(self.events, key=lambda x: x.timestamp)
         agents: Dict[str, list] = {}
         agent_y: Dict[str, int] = {}
@@ -719,7 +701,7 @@ class MultiAgentTracer:
                 if e.parent_event_id not in visible_start_ids:
                     continue
             else:
-                continue  # MESSAGE/ERROR/CUSTOM — обработаем позже в стрелках
+                continue  
 
             nm = canon(e.agent_name)
             if nm not in agents:
@@ -736,7 +718,6 @@ class MultiAgentTracer:
 
         fig = go.Figure()
 
-        # lifelines + activation boxes + точки START/END
         for nm, yy in agent_y.items():
             fig.add_trace(go.Scatter(
                 x=[datetime.fromtimestamp(t0), datetime.fromtimestamp(t1)],
@@ -773,8 +754,6 @@ class MultiAgentTracer:
                         hoverinfo="text", showlegend=False
                     ))
 
-        # стрелки: сначала структурные (parent START -> child START), потом message_sent
-        # -- поднимаем родителя к видимому предку
         def lift_to_visible(start_id: Optional[str]) -> Optional[str]:
             cur = start_id
             visited = set()
@@ -786,8 +765,8 @@ class MultiAgentTracer:
             return cur if cur in visible_start_ids else None
 
         idx = {e.event_id: e for e in evs_sorted}
-        added_event_pairs = set()     # (parent_start_id, child_start_id)
-        struct_name_pairs = set()     # (from_name, to_name) — для блокировки дубля message_sent
+        added_event_pairs = set()    
+        struct_name_pairs = set()    
 
         for sid in visible_start_ids:
             s = starts[sid]
@@ -809,7 +788,6 @@ class MultiAgentTracer:
                     arrowhead=3, arrowsize=1.0, arrowwidth=1.4, arrowcolor="#3498DB", opacity=0.85
                 )
 
-        # message_sent — рисуем только если НЕТ структурной связи между этими именами
         for e in evs_sorted:
             if e.event_type != EventType.MESSAGE_SENT:
                 continue
@@ -850,7 +828,6 @@ class MultiAgentTracer:
         if not self.events:
             return go.Figure()
 
-        # те же правила видимости, что и в rebuild/sequence
         starts: Dict[str, TraceEvent] = {}
         ends: Dict[str, TraceEvent] = {}
         for e in self.events:
@@ -923,7 +900,7 @@ class MultiAgentTracer:
             }
 
         total_events = len(self.events)
-        # успехи считаем по *_END событиям
+
         end_events = [e for e in self.events if e.event_type in (EventType.AGENT_END, EventType.TOOL_END)]
         successful_events = sum(1 for e in end_events if bool(e.success))
         failed_events = len(end_events) - successful_events
@@ -1050,7 +1027,7 @@ class MultiAgentTracer:
         if not self.events:
             return
 
-        # 1) индексы
+
         starts: Dict[str, TraceEvent] = {}
         end_by_parent: Dict[str, TraceEvent] = {}
         children: Dict[str, list] = {}
@@ -1065,7 +1042,6 @@ class MultiAgentTracer:
             if s.parent_event_id:
                 children.setdefault(s.parent_event_id, []).append(s.event_id)
 
-        # 2) решаем, какие стартовые узлы оставлять
         keep: Set[str] = set()
         drop: Set[str] = set()
         for sid, s in starts.items():
@@ -1074,7 +1050,6 @@ class MultiAgentTracer:
             else:
                 keep.add(sid)
 
-        # 3) создаём узлы для keep с каноническими именами
         for sid in keep:
             s = starts[sid]
             self.call_graph.add_node(
@@ -1084,7 +1059,6 @@ class MultiAgentTracer:
                 start_time=s.timestamp,
             )
 
-        # 4) вспомогательный «подъём» к ближ. видимому предку
         def lift_to_visible(start_id: Optional[str]) -> Optional[str]:
             cur = start_id
             visited = set()
@@ -1095,7 +1069,6 @@ class MultiAgentTracer:
                 cur = starts[cur].parent_event_id
             return cur if cur in keep else None
 
-        # 5) рёбра parent -> child (для видимых)
         for sid, s in starts.items():
             if sid in drop:
                 continue
@@ -1103,9 +1076,8 @@ class MultiAgentTracer:
             if parent_vis and parent_vis in self.call_graph and sid in self.call_graph and parent_vis != sid:
                 self.call_graph.add_edge(parent_vis, sid)
 
-        # 6) рёбра через скрытые узлы: предок(hid) -> внук(child)
         for hid in drop:
-            # ближайший видимый предок скрытого узла
+
             pv = lift_to_visible(starts[hid].parent_event_id if hid in starts else None)
             if not pv:
                 continue
@@ -1113,7 +1085,6 @@ class MultiAgentTracer:
                 if ch in keep and pv in self.call_graph and ch in self.call_graph and pv != ch:
                     self.call_graph.add_edge(pv, ch)
 
-        # 7) duration/success/end_time из *_END
         for sid in keep:
             end = end_by_parent.get(sid)
             if end and sid in self.call_graph:
@@ -1213,14 +1184,11 @@ class LangGraphTracer:
         if not self.events:
             print("Нет событий для создания диаграммы последовательности")
             return go.Figure()
-        
-        # Сортируем события по времени
+
         sorted_events = sorted(self.events, key=lambda x: x.timestamp)
-        
-        # Создаем временную ось
+
         fig = go.Figure()
-        
-        # Группируем события по агентам
+
         agents = {}
         agent_positions = {}
         y_pos = 0
@@ -1231,8 +1199,7 @@ class LangGraphTracer:
                 agent_positions[event.agent_name] = y_pos
                 y_pos += 1
             agents[event.agent_name].append(event)
-        
-        # Цвета для разных типов событий
+
         event_colors = {
             'AGENT_START': '#2ECC71',
             'AGENT_END': '#3498DB', 
@@ -1242,12 +1209,10 @@ class LangGraphTracer:
             'ERROR': '#E74C3C',
             'CUSTOM': '#95A5A6'
         }
-        
-        # Добавляем временные линии для каждого агента
+
         for agent_name, y_position in agent_positions.items():
             agent_events = agents[agent_name]
-            
-            # Линия жизни агента
+
             fig.add_trace(go.Scatter(
                 x=[datetime.fromtimestamp(sorted_events[0].timestamp),
                     datetime.fromtimestamp(sorted_events[-1].timestamp)],
@@ -1257,15 +1222,12 @@ class LangGraphTracer:
                 showlegend=False,
                 hoverinfo='skip'
             ))
-            
-            # События агента
+
             for event in agent_events:
                 color = event_colors.get(event.event_type.name, '#95A5A6')
-                
-                # Размер маркера зависит от типа события
+
                 marker_size = 15 if event.event_type.name in ['AGENT_START', 'AGENT_END'] else 8
-                
-                # Символ маркера
+
                 if event.event_type.value == 'ERROR':
                     symbol = 'x'
                 elif event.event_type.value in ['AGENT_START', 'TOOL_START']:
@@ -1274,8 +1236,7 @@ class LangGraphTracer:
                     symbol = 'square'
                 else:
                     symbol = 'diamond'
-                
-                # Hover информация
+
                 hover_text = f"""
                 <b>{event.agent_name}</b><br>
                 Событие: {event.event_type.value}<br>
@@ -1298,14 +1259,12 @@ class LangGraphTracer:
                     hoverinfo='text',
                     showlegend=False
                 ))
-        
-        # Добавляем стрелки для связей между агентами
+
         for event in sorted_events:
             if event.parent_event_id:
-                # Находим родительское событие
+
                 parent_event = next((e for e in sorted_events if e.event_id == event.parent_event_id), None)
                 if parent_event and parent_event.agent_name != event.agent_name:
-                    # Добавляем стрелку между агентами
                 
                     fig.add_annotation(
                         x=datetime.fromtimestamp(event.timestamp),
@@ -1331,10 +1290,9 @@ class LangGraphTracer:
                         ax=t, ay=agent_positions[frm],
                         xref="x", yref="y", axref="x", ayref="y",
                         arrowhead=3, arrowsize=1.0, arrowwidth=1.2,
-                        arrowcolor="#9B59B6",  # тот же цвет, что и в legend для MESSAGE_SENT
+                        arrowcolor="#9B59B6",  
                         opacity=0.85, standoff=4
                     )
-        # Создаем легенду для типов событий
         for event_type, color in event_colors.items():
             fig.add_trace(go.Scatter(
                 x=[None], y=[None],
@@ -1344,7 +1302,6 @@ class LangGraphTracer:
                 showlegend=True
             ))
         
-        # Настройка макета
         fig.update_layout(
             title={
                 'text': '📊 Agent Execution Sequence Diagram',

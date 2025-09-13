@@ -27,7 +27,7 @@ from multiagent_tracer.multiagent_tracer import AgentType, MultiAgentTracer
 tracer = MultiAgentTracer(
     session_id="notebook_session",
     log_file=None,                 # можно указать путь к файлу .log
-    enable_real_time_viz=False,    # True — если хотите обновление графа на лету
+    enable_real_time_viz=False,    # True — если нужно обновление графа на лету
 )
 @contextmanager
 def trace_block(agent_name: str,
@@ -43,12 +43,10 @@ def trace_block(agent_name: str,
     try:
         yield eid
     except Exception as e:
-        # фикс: логируем и ЗДЕСЬ же безопасно перекидываем исключение
         tracer.log_error(agent_name, e, parent_event_id=eid)
         tracer.end_trace(eid, {"error": str(e)}, success=False)
         raise
     else:
-        # если исключения не было — закрываем с success=True
         tracer.end_trace(eid, {"success": True}, success=True)
 
 
@@ -95,12 +93,12 @@ class RouterAgent:
         )
 
     def _extract_json(self, s: str) -> dict:
-        # 1) попробуем прямой json.loads
+
         try:
             return json.loads(s)
         except Exception:
             pass
-        # 2) выцепим самый длинный JSON-блок фигурных скобок (устойчивее, чем {[^}]*})
+
         candidates = []
         stack = []
         start = None
@@ -137,14 +135,13 @@ class RouterAgent:
         q = query.lower()
         c = context.lower()
 
-        # Если уже есть выход поиска — идём в анализ
         if "search_agent output" in c or "найдено" in c or "результат поиска" in c:
             return {
                 "next_agent": "ANALYSIS_AGENT",
                 "reason": "Post-search analysis step",
                 "input": context
             }
-        # Если уже есть анализ — финализируем отчёт
+
         if "analysis_agent output" in c or "анализ" in c or "summary" in c:
             return {
                 "next_agent": "REPORT_AGENT",
@@ -154,7 +151,7 @@ class RouterAgent:
         # Триггеры «нужна свежесть»
         if any(t in q for t in ["нов", "свеж", "сегодня", "вчера", "202", "цена", "курс", "последн", "latest", "today", "news"]):
             return {"next_agent": "SEARCH_AGENT", "reason": "Fresh info likely needed", "input": query}
-        # По умолчанию — анализ
+        
         return {"next_agent": "ANALYSIS_AGENT", "reason": "Direct analysis", "input": query}
 
 
@@ -497,7 +494,7 @@ async def orchestrate(task: TaskRequest):
                 }
 
                 tool_eid = tracer.log_tool_start(
-                    agent_name=f"http_call::{next_agent}",   # <-- одинаковый agent_name в start и end
+                    agent_name=f"http_call::{next_agent}",   
                     tool_name="HTTP POST",
                     tool_input={"url": agent_url, "json": {"input": agent_input[:500]}},
                     parent_event_id=http_eid
@@ -575,7 +572,6 @@ async def orchestrate(task: TaskRequest):
 @orchestrator_app.post("/test_router")
 async def test_router(task: TaskRequest):
     """Тестовый эндпоинт для проверки работы роутера"""
-    # Корневой эвент запроса
     root_eid = tracer.start_trace(
         agent_name="orchestrator/test_router",
         agent_type=AgentType.ORCHESTRATOR,
